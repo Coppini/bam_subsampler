@@ -11,13 +11,14 @@ from pathlib import Path
 import pysam
 import tqdm
 
-from subsampler_worker import ReferenceJobInput, process_reference
+from subsampler_worker import ReferenceJobInput, ReferenceJobOutput, process_reference, format_memory, format_duration
 
-def subsample_bam_parallel(input_bam: Path, output_bam: Path, desired_coverage: int = 50, seed: int = 42, threads: int = 1):
+def subsample_bam_parallel(input_bam: Path, output_bam: Path, desired_coverage: int = 50, seed: int = 42, threads: int = 1) -> Path:
     tracemalloc.start()
     start = datetime.datetime.now()
     if threads == 0:
         threads = max(1, (multiprocessing.cpu_count() - 1))
+    track_with_tqdm = True if threads == 1 else False
     try:
         with pysam.AlignmentFile(input_bam, "rb") as bamfile:
             args_list = [
@@ -27,29 +28,30 @@ def subsample_bam_parallel(input_bam: Path, output_bam: Path, desired_coverage: 
                     desired_coverage=desired_coverage,
                     seed=(seed + i),
                     tmp_file_path=Path(tempfile.NamedTemporaryFile(delete=False, suffix=f".{reference}.bam").name),
+                    track_with_tqdm=track_with_tqdm,
                 )
                 for i, reference in enumerate(sorted(bamfile.references))
             ]
         tmp_file_paths = [reference_job_input.tmp_file_path for reference_job_input in args_list]
 
         with multiprocessing.Pool(processes=threads) as pool:
-            reference_job_outputs = list(tqdm.tqdm(pool.imap_unordered(process_reference, args_list), total=len(args_list), desc="Processing references"))
-
+            reference_job_outputs: list[ReferenceJobOutput] = list(tqdm.tqdm(pool.imap_unordered(process_reference, args_list), total=len(args_list), desc="Processing references"))
+            
         with pysam.AlignmentFile(input_bam, "rb") as bamfile:
             header = bamfile.header
 
         with pysam.AlignmentFile(output_bam, "wb", header=header) as final_bam:
-            for _reference, reference_temp_bam in reference_job_outputs:
-                with pysam.AlignmentFile(reference_temp_bam, "rb") as tmp_fh:
+            for reference_job_output in reference_job_outputs:
+                with pysam.AlignmentFile(reference_job_output.temp_bam, "rb") as tmp_fh:
                     for read in tmp_fh:
                         final_bam.write(read)
-                Path(reference_temp_bam).unlink()
+                if reference_job_output.temp_bam.exists:
+                    Path(reference_job_output.temp_bam).unlink()
         current, peak = tracemalloc.get_traced_memory()
         print(
             "Done subsampling.\n"
-            f"It took {datetime.datetime.now() - start} time to run.\n"
-            f"Current memory usage: {current / 10**6:.2f} MB;\n"
-            f"Peak memory usage: {peak / 10**6:.2f} MB"
+            f"It took {format_duration(datetime.datetime.now() - start)} time to run.\n"
+            f"Peak memory usage: {format_memory(peak)}"
         )
         return output_bam
     except:
