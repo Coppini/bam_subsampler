@@ -2,6 +2,7 @@
 
 import argparse
 import datetime
+import gc
 import logging
 import multiprocessing
 import random
@@ -28,6 +29,7 @@ from subsampler_worker import (
 DEFAULT_COVERAGE = 50
 DEFAULT_SEED = 42
 DEFAULT_THREADS = 1
+DEFAULT_LOW_COV_BASES_TO_PRIORITIZE = 10
 
 
 class AsyncJob(NamedTuple):
@@ -40,6 +42,13 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
+
+
+def get_read_count(bamfile: Path, reference: str) -> int:
+    bamfile.seek(0)
+    read_count = bamfile.count(reference=reference)
+    bamfile.seek(0)
+    return read_count
 
 
 def parse_memory_limit(mem_str: str) -> float:
@@ -66,34 +75,46 @@ def get_used_memory_gb() -> float:
 
 def adaptive_parallel_run(
     pool,
-    jobs: Iterable[ReferenceJobInput],
+    jobs: list[ReferenceJobInput],
     threads: int,
+    contigs_to_parallelize_on: int,
     max_memory_gb: float | None = None,
     check_interval: datetime.timedelta = datetime.timedelta(seconds=1),
 ) -> Iterable[ReferenceJobOutput]:
     active: list[AsyncJob] = list()
-    pending = jobs.copy()
+    pending: list[ReferenceJobInput] = jobs.copy()
     completed_bar = tqdm.tqdm(
         total=len(jobs), desc="Processing references", unit=" references"
     )
     try:
         while pending or active:
+            threads_in_use = max(
+                len(active), sum(async_job.job_input.threads for async_job in active)
+            )
+            available_threads = threads - threads_in_use
+            available_slots = min(len(pending), contigs_to_parallelize_on - len(active))
             done = [result for result in active if result.async_result.ready()]
             for result in done:
                 active.remove(result)
                 completed_bar.update(1)
+                gc.collect()
                 yield result.async_result.get()
             # Launch a new job if memory allows
             if (
                 pending
-                and len(active) < threads
+                and available_threads
+                and available_slots
                 and (
-                    (len(active) == 0)
-                    or (max_memory_gb is None)
+                    len(active) == 0
+                    or max_memory_gb is None
                     or (0 < get_used_memory_gb() < max_memory_gb)
                 )
             ):
-                job = pending.pop(0)
+                job: ReferenceJobInput = pending.pop(0)
+                if available_threads > available_slots:
+                    job.threads = max(
+                        2, job.threads, available_threads // available_slots
+                    )
                 async_result = AsyncJob(
                     job_input=job,
                     async_result=pool.apply_async(process_reference, (job,)),
@@ -109,63 +130,113 @@ def subsample_bam_parallel(
     input_bam: Path,
     output_bam: Path,
     desired_coverage: int = DEFAULT_COVERAGE,
+    low_coverage_bases_to_prioritize: int = DEFAULT_LOW_COV_BASES_TO_PRIORITIZE,
+    ignore_n_bases_on_edges: int = 0,
     seed: int = DEFAULT_SEED,
     threads: int = DEFAULT_THREADS,
+    contigs_to_parallelize_on: int = 0,
     max_memory: str | None = None,
+    check_interval: datetime.timedelta = datetime.timedelta(seconds=1),
+    verbose: bool = False,
 ) -> Path:
     tracemalloc.start()
     start = datetime.datetime.now()
     timestamp = start.strftime("%Y%m%d_%H%M%S") + f"{start.microsecond / 1e6:.4f}"[1:]
     if threads == 0:
         threads = max(1, (multiprocessing.cpu_count() - 1))
-    track_with_tqdm = True if threads == 1 else False
+    elif threads < 0:
+        raise ValueError(f"{threads=} (should be greater or equal to 0)")
+    if contigs_to_parallelize_on == 0 or contigs_to_parallelize_on > threads:
+        contigs_to_parallelize_on = threads
+    elif contigs_to_parallelize_on < 0:
+        raise ValueError(
+            f"{contigs_to_parallelize_on=} (should be greater or equal to 0)"
+        )
+    track_with_tqdm = True if (threads == 1 or verbose) else False
     reference_job_outputs = list()
+    reference_to_tmp_file_paths = dict()
     try:
-        with pysam.AlignmentFile(input_bam, "rb") as bamfile:
+        with pysam.AlignmentFile(input_bam, "rb", threads=threads) as bamfile:
+            references = bamfile.references
+            logging.debug(f"{len(references)} references found in the BAM file.\n")
+            reference_to_lengths: dict[str, int] = {
+                reference: bamfile.get_reference_length(reference)
+                for reference in references
+            }
+            reference_to_read_counts: dict[str, int] = (
+                {reference: None for reference in references}
+                # {
+                #     reference: get_read_count(bamfile, reference=reference)
+                #     for reference, _ in tqdm.tqdm(
+                #         sorted(reference_to_lengths.items(), key=lambda ref_to_len: ref_to_len[1], reverse=True),
+                #         desc="Calculating read count per reference",
+                #         unit=" references"
+                #     )
+                # }
+            )
             reference_to_tmp_file_paths = {
                 reference: Path(
                     tempfile.NamedTemporaryFile(
-                        delete=False, prefix=f"{timestamp}.{reference}.", suffix=".bam"
+                        delete=False, prefix=f"{timestamp}.{reference}.", suffix=f".bam"
                     ).name
                 )
-                for reference in bamfile.references
+                for reference in references
             }
-            logging.debug(
-                f"{len(reference_to_tmp_file_paths)} references found in the BAM file."
-            )
-            args_list = sorted(
-                (
-                    ReferenceJobInput(
-                        reference=reference,
-                        reference_length=bamfile.get_reference_length(reference),
-                        input_bam_path=input_bam,
-                        desired_coverage=desired_coverage,
-                        seed=(seed + i),
-                        tmp_file_path=reference_to_tmp_file_paths[reference],
-                        track_with_tqdm=track_with_tqdm,
+            args_list = [
+                ReferenceJobInput(
+                    reference=reference,
+                    reference_length=reference_to_lengths[reference],
+                    read_count=reference_to_read_counts[reference],
+                    input_bam_path=input_bam,
+                    desired_coverage=desired_coverage,
+                    low_coverage_bases_to_prioritize=low_coverage_bases_to_prioritize,
+                    ignore_n_bases_on_edges=ignore_n_bases_on_edges,
+                    seed=(seed + i),
+                    tmp_file_path=reference_to_tmp_file_paths[reference],
+                    profile=True,
+                    threads=max(
+                        1,
+                        threads // min(len(references), contigs_to_parallelize_on),
+                    ),
+                    track_with_tqdm=track_with_tqdm,
+                    tqdm_position=(
+                        i
+                        if (track_with_tqdm and contigs_to_parallelize_on > 1)
+                        else None
+                    ),
+                )
+                for i, reference in enumerate(
+                    sorted(
+                        references,
+                        key=lambda ref: (
+                            reference_to_read_counts[ref],
+                            reference_to_lengths[ref],
+                            ref,
+                        ),
                     )
-                    for i, reference in tqdm.tqdm(
-                        enumerate(list(reference_to_tmp_file_paths.keys())),
-                        desc="Calculating read count and reference lengths",
-                        unit=" references",
-                    )
-                ),
-                key=lambda x: x.reference_length,
-            )
+                )
+            ]
 
-        with multiprocessing.Pool(processes=threads) as pool:
-            for result in adaptive_parallel_run(
-                pool,
-                jobs=args_list,
-                threads=threads,
-                max_memory_gb=(
-                    None
-                    if max_memory is None
-                    else (parse_memory_limit(max_memory) / threads)
-                ),
-                check_interval=datetime.timedelta(seconds=1),
-            ):
-                reference_job_outputs.append(result)
+        if contigs_to_parallelize_on == 1:
+            for job in args_list:
+                reference_job_outputs.append(process_reference(job))
+        else:
+            with multiprocessing.Pool(
+                processes=min(threads, contigs_to_parallelize_on)
+            ) as pool:
+                for result in adaptive_parallel_run(
+                    pool,
+                    jobs=args_list,
+                    threads=threads,
+                    contigs_to_parallelize_on=contigs_to_parallelize_on,
+                    max_memory_gb=(
+                        None
+                        if max_memory is None
+                        else (parse_memory_limit(max_memory) / threads)
+                    ),
+                    check_interval=check_interval,
+                ):
+                    reference_job_outputs.append(result)
 
         with pysam.AlignmentFile(input_bam, "rb") as bamfile:
             header = bamfile.header
@@ -183,7 +254,7 @@ def subsample_bam_parallel(
         logging.info(
             f"It took {format_duration(datetime.datetime.now() - start)} time to run."
         )
-        logging.debug(f"Peak memory usage in a single reference: {format_memory(peak)}")
+        logging.debug(f"Peak memory usage in a SINGLE reference: {format_memory(peak)}")
         return output_bam
     except:
         logging.warning("Interrupted! Cleaning up temporary files...")
@@ -222,17 +293,48 @@ if __name__ == "__main__":
         help=f"Random seed (default {DEFAULT_SEED}).",
     )
     parser.add_argument(
+        "-t",
+        "--threads",
+        type=int,
+        default=DEFAULT_THREADS,
+        help=f"Number of parallel processes to use (default {DEFAULT_THREADS}). 0 to use all threads (might require a lot of memory for large genomes)",
+    )
+    parser.add_argument(
+        "--contigs-to-parallelize-on",
+        type=int,
+        default=0,
+        help="How many contigs to parallelize on (default: 0 means one contig per thread)",
+    )
+    parser.add_argument(
         "--max-memory",
         type=str,
         default=None,
         help="Maximum memory usage (e.g. 20GB, 20000MB, or 20).",
     )
     parser.add_argument(
-        "-t",
-        "--threads",
+        "--check-interval",
         type=int,
-        default=DEFAULT_THREADS,
-        help=f"Number of parallel processes to use (default {DEFAULT_THREADS}). 0 to use all threads (might require a lot of memory for large genomes)",
+        default=1,
+        help="Interval in seconds to wait for before spawning a new job when parallelizing over contigs/references",
+    )
+    parser.add_argument(
+        "--low-coverage-bases-to-prioritize",
+        type=int,
+        default=DEFAULT_LOW_COV_BASES_TO_PRIORITIZE,
+        help=f"Prioritize reads with the N positions with lowest coverages (default: {DEFAULT_LOW_COV_BASES_TO_PRIORITIZE})",
+    )
+    parser.add_argument(
+        "--ignore-n-bases-on-edges",
+        type=int,
+        default=0,
+        help=f"Ignore N bases from start/end of a read when calculating coverage of each position (with the exception of reads starting/ending the contig) (default: 0)",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Whether it should print tqdm bars even when running multithreaded or not",
     )
 
     args = parser.parse_args()
@@ -247,5 +349,14 @@ if __name__ == "__main__":
         desired_coverage=args.coverage,
         seed=args.seed,
         threads=args.threads,
+        contigs_to_parallelize_on=(
+            args.contigs_to_parallelize_on
+            if args.contigs_to_parallelize_on
+            else args.threads
+        ),
         max_memory=args.max_memory,
+        check_interval=datetime.timedelta(seconds=args.check_interval),
+        verbose=args.verbose,
+        ignore_n_bases_on_edges=args.ignore_n_bases_on_edges,
+        low_coverage_bases_to_prioritize=args.low_coverage_bases_to_prioritize,
     )
