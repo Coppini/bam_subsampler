@@ -219,14 +219,17 @@ if __name__ == "__main__":
         "--ignore-n-bases-on-edges",
         type=int,
         default=0,
-        help=f"Ignore N bases from start/end of a read when calculating coverage of each position (with the exception of reads starting/ending the contig) (default: 0)",
+        help=(
+            f"[⚠️ Experimental] Ignore N bases from start/end of a read when calculating coverage of each position"
+            " (with the exception of reads starting/ending the contig). Might be useful if reads have lower quality on the start/end. (default: 0)"
+        ),
     )
     parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
         default=False,
-        help="Whether it should print tqdm bars even when running multithreaded or not",
+        help="Whether it should print tqdm bars even when running parallel over multiple contigs or not. By default, bars are shown when running in single-contig mode, but not when over several.",
     )
 
     args = parser.parse_args()
