@@ -86,7 +86,9 @@ def adaptive_parallel_run(
     completed_bar = tqdm.tqdm(
         total=len(jobs), desc="Processing references", unit=" references"
     )
-    try:
+    with tqdm.tqdm(
+        total=len(jobs), desc="Processing references", unit=" references"
+    ) as completed_bar:
         while pending or active:
             threads_in_use = max(
                 len(active), sum(async_job.job_input.threads for async_job in active)
@@ -122,8 +124,6 @@ def adaptive_parallel_run(
                 active.append(async_result)
             else:
                 time.sleep(check_interval.total_seconds())
-    finally:
-        completed_bar.close()
 
 
 def subsample_bam_parallel(

@@ -201,31 +201,30 @@ def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
     total_hashes = len(read_hash_to_spans)
     random_ceil = coverage_cap + (total_hashes * 10)
 
-    def coverage_vector(spans: list[tuple[int, int]]) -> tuple[int, ...]:
-        coverages = coverage_array[get_unique_positions(spans)]
-        return tuple(
-            heapq.nsmallest(low_coverage_bases_to_prioritize, coverages)
-            + [random.randint(coverage_cap, random_ceil)]
-        )
+    with tqdm.tqdm(
+        total=total_hashes,
+        desc=f"Sorting read pairs by the {low_coverage_bases_to_prioritize} positions with lowest coverages for {reference}",
+        disable=disable_tqdm,
+        unit=" read pairs",
+        position=tqdm_position,
+        leave=True,
+    ) as sorting_bar:
 
-    return [
-        (read_hash, spans)
-        for (read_hash, spans), _ in sorted(
-            (
-                (item, coverage_vector(item[1]))
-                for item in tqdm.tqdm(
-                    read_hash_to_spans.items(),
-                    total=total_hashes,
-                    desc=f"Sorting read pairs by the {low_coverage_bases_to_prioritize} positions with lowest coverages for {reference}",
-                    disable=disable_tqdm,
-                    unit=" read pairs",
-                    position=tqdm_position,
-                    leave=True,
+        def coverage_vector(spans: list[tuple[int, int]]) -> tuple[int, ...]:
+            coverages = tuple(
+                heapq.nsmallest(
+                    low_coverage_bases_to_prioritize,
+                    coverage_array[get_unique_positions(spans)],
                 )
-            ),
-            key=lambda x: x[1],
+                + [random.randint(coverage_cap, random_ceil)]
+            )
+            sorting_bar.update(1)
+            return coverages
+
+        return sorted(
+            read_hash_to_spans.items(),
+            key=lambda rh_2_s: coverage_vector(rh_2_s[1]),
         )
-    ]
 
 
 def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
@@ -291,18 +290,17 @@ def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
         )
         coverage_limiter = np.iinfo(coverage_array.dtype).max - 10
         selected_read_hashes = set()
-        sorted_read_hash_and_spans = (
-            get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
-                bamfile=bamfile,
-                reference=args.reference,
-                reference_length=args.reference_length,
-                coverage_cap=coverage_cap,
-                read_count=read_count,
-                disable_tqdm=disable_tqdm,
-                low_coverage_bases_to_prioritize=args.low_coverage_bases_to_prioritize,
-                tqdm_position=args.tqdm_position,
-            )
+        sorted_read_hash_and_spans = get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
+            bamfile=bamfile,
+            reference=args.reference,
+            reference_length=args.reference_length,
+            coverage_cap=coverage_cap,
+            read_count=read_count,
+            disable_tqdm=disable_tqdm,
+            low_coverage_bases_to_prioritize=args.low_coverage_bases_to_prioritize,
+            tqdm_position=args.tqdm_position,
         )
+        gc.collect()
         for read_hash, spans in tqdm.tqdm(
             sorted_read_hash_and_spans,
             desc=(f"Selecting reads for {args.reference}"),
