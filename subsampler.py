@@ -195,19 +195,25 @@ if __name__ == "__main__":
         "--threads",
         type=int,
         default=DEFAULT_THREADS,
-        help=f"Number of parallel processes to use (default {DEFAULT_THREADS}). 0 to use all threads (might require a lot of memory for large genomes)",
+        help=f"Number of threads to use. 0 to use all threads. Safe to increase without increasing memory usage. (default: {DEFAULT_THREADS}).",
     )
     parser.add_argument(
         "--contigs-to-parallelize-on",
         type=int,
-        default=0,
-        help="How many contigs to parallelize on (default: 0 means one contig per thread)",
+        default=1,
+        help="[⚠️ Experimental - increases RAM usage a lot] How many contigs to parallelize on. 0 means one contig per thread. Higher numbers mean more usage. (default: 1 - do not parallelize over contigs)",
     )
     parser.add_argument(
         "--low-coverage-bases-to-prioritize",
         type=int,
         default=DEFAULT_LOW_COV_BASES_TO_PRIORITIZE,
-        help=f"Prioritize reads with the N positions with lowest coverages (default: {DEFAULT_LOW_COV_BASES_TO_PRIORITIZE})",
+        help=(
+            "Prioritize reads with the N positions with lowest coverages"
+            f" (default: {DEFAULT_LOW_COV_BASES_TO_PRIORITIZE})."
+            " Higher values will increase memory usage but make the overall coverage distribution more uniform (less positions that end up above the desired coverage)."
+            " Lower values will take less memory and increase randomness, but might allow for more coverage spikes in the resulting BAM."
+            " Currently testing with values between 3 and 15."
+        ),
     )
     parser.add_argument(
         "--ignore-n-bases-on-edges",
