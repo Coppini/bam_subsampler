@@ -134,7 +134,7 @@ def subsample_bam_parallel(
     ignore_n_bases_on_edges: int = 0,
     seed: int = DEFAULT_SEED,
     threads: int = DEFAULT_THREADS,
-    contigs_to_parallelize_on: int = 0,
+    contigs_to_parallelize_on: int = 1,
     max_memory: str | None = None,
     check_interval: datetime.timedelta = datetime.timedelta(seconds=1),
     verbose: bool = False,
@@ -152,7 +152,7 @@ def subsample_bam_parallel(
         raise ValueError(
             f"{contigs_to_parallelize_on=} (should be greater or equal to 0)"
         )
-    track_with_tqdm = True if (threads == 1 or verbose) else False
+    track_with_tqdm = True if (contigs_to_parallelize_on == 1 or verbose) else False
     reference_job_outputs = list()
     reference_to_tmp_file_paths = dict()
     try:
@@ -302,7 +302,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--contigs-to-parallelize-on",
         type=int,
-        default=0,
+        default=1,
         help="How many contigs to parallelize on (default: 0 means one contig per thread)",
     )
     parser.add_argument(

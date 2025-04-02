@@ -53,6 +53,15 @@ class ReferenceJobOutput:
 
 
 def format_memory(bytes_amount: int) -> str:
+    """
+    Format a memory size in bytes into a human-readable string (GB, MB, KB).
+
+    Args:
+        bytes_amount (int): Number of bytes.
+
+    Returns:
+        str: Human-readable memory size string.
+    """
     gb = bytes_amount / 10**9
     if gb >= 1:
         return f"{gb:.2f} GB"
@@ -66,6 +75,15 @@ def format_memory(bytes_amount: int) -> str:
 
 
 def format_duration(delta: datetime.timedelta) -> str:
+    """
+    Format a time duration into a human-readable string with hours, minutes, and seconds.
+
+    Args:
+        delta (datetime.timedelta): Time duration.
+
+    Returns:
+        str: Formatted duration string.
+    """
     total_seconds = delta.total_seconds()
     hours, remainder = divmod(int(total_seconds), 3600)
     minutes, _ = divmod(remainder, 60)
@@ -86,6 +104,17 @@ def get_unique_positions(
     trim_n_bases: int = 0,
     reference_length: int | None = None,
 ) -> np.ndarray:
+    """
+    Compute the unique genomic positions covered by a list of read spans.
+
+    Args:
+        spans (list[tuple[int, int]]): List of (start, end) read spans.
+        trim_n_bases (int): Number of bases to trim from each end of a span.
+        reference_length (int | None): Length of the reference sequence.
+
+    Returns:
+        np.ndarray: Sorted array of unique positions.
+    """
     return np.unique(
         np.concatenate(
             [
@@ -99,10 +128,6 @@ def get_unique_positions(
     )
 
 
-def get_start_end(p1: int, p2: int) -> tuple[int, int]:
-    return min(p1, p2), max(p1, p2)
-
-
 def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
     bamfile: pysam.AlignmentFile,
     reference: str,
@@ -113,6 +138,24 @@ def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
     disable_tqdm: bool = False,
     tqdm_position: int = 0,
 ) -> list[tuple[int, list[tuple[int, int]]]]:
+    """
+    Iterates through reads of a given reference in the BAM file, collects their spans,
+    builds a coverage array across the reference, and yields read spans sorted by
+    increasing coverage (prioritizing under-covered regions).
+
+    Args:
+        bamfile (pysam.AlignmentFile): Opened BAM file object.
+        reference (str): The name of the reference (contig) to process.
+        reference_length (int): Length of the reference sequence.
+        coverage_cap (int): Maximum coverage value to consider per base. Anything equal or higher than this value is considered the same when sorting by coverage.
+        read_count (int | None): Number of reads in the reference. If None, it will be counted.
+        disable_tqdm (bool): If True, disables the tqdm progress bars.
+        low_coverage_bases_to_prioritize (int): Number of lowest-coverage positions to use as sort priority per read.
+        tqdm_position (int): Vertical position of the tqdm bar in the terminal (for multi-bar display).
+
+    Returns:
+        list: List of (read_hash, spans) sorted by coverage priority.
+    """
     bamfile.seek(0)
     if read_count is None:
         read_count = bamfile.count(reference=reference)
@@ -186,6 +229,32 @@ def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
 
 
 def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
+    """
+    Process a single reference (contig) from a BAM file:
+    - Selects reads to match a target per-base coverage.
+    - Prioritizes reads that cover underrepresented regions.
+    - Writes selected reads to a temporary BAM file.
+
+    Args:
+        args (ReferenceJobInput): Job configuration and metadata for processing the contig.
+            - reference (str): Name of the reference/contig.
+            - reference_length (int): Length of the reference sequence.
+            - read_count (int | None): Number of reads for this reference. If None, it will be counted.
+            - input_bam_path (str): Path to the original input BAM file.
+            - desired_coverage (int): Target per-base coverage to reach.
+            - low_coverage_bases_to_prioritize (int): Number of lowest-coverage positions to use as sort priority per read.
+            - ignore_n_bases_on_edges (int): Number of bases to ignore at the start and end of reads for coverage.
+            - seed (int): Seed for reproducibility (used for shuffling reads with the same lowest coverages).
+            - tmp_file_path (Path): Path to the temporary output BAM file.
+            - profile (bool): Whether to collect memory profiling statistics with tracemalloc.
+            - threads (int): Number of threads to use for BAM I/O operations.
+            - tqdm_position (int): Position of the progress bar (used in multi-bar tqdm).
+            - track_with_tqdm (bool): Whether to display tqdm progress bars.
+
+    Returns:
+        ReferenceJobOutput: Metadata for the result, including the reference name,
+        path to the temporary output BAM, and peak memory used during the process.
+    """
     start_time = datetime.datetime.now()
     if args.profile:
         tracemalloc.start()

@@ -33,6 +33,16 @@ logging.basicConfig(
 
 
 def get_read_count(bamfile: Path, reference: str) -> int:
+    """
+    Count the number of reads mapped to a specific reference (contig) in a BAM file.
+
+    Args:
+        bamfile (Path): Path to the input BAM file.
+        reference (str): Reference (contig) name.
+
+    Returns:
+        int: Number of reads aligned to the specified reference.
+    """
     bamfile.seek(0)
     read_count = bamfile.count(reference=reference)
     bamfile.seek(0)
@@ -47,9 +57,26 @@ def subsample_bam_parallel(
     ignore_n_bases_on_edges: int = 0,
     seed: int = DEFAULT_SEED,
     threads: int = DEFAULT_THREADS,
-    contigs_to_parallelize_on: int = 0,
+    contigs_to_parallelize_on: int = 1,
     verbose: bool = False,
 ) -> Path:
+    """
+    Subsample a BAM file to reach a target per-base coverage, using multi-threaded or multi-contig parallelization.
+
+    Args:
+        input_bam (Path): Path to the input BAM file.
+        output_bam (Path): Path where the output BAM file will be written.
+        desired_coverage (int): Target per-base coverage.
+        low_coverage_bases_to_prioritize (int): Number of low-coverage positions to prioritize during sorting.
+        ignore_n_bases_on_edges (int): Number of bases to ignore from start/end of reads for coverage counting.
+        seed (int): Random seed for reproducibility.
+        threads (int): Number of threads to use.
+        contigs_to_parallelize_on (int): Number of references (contigs) to process in parallel.
+        verbose (bool): Whether to show progress bars even in multi-contig mode.
+
+    Returns:
+        Path: Path to the final subsampled BAM file.
+    """
     tracemalloc.start()
     start = datetime.datetime.now()
     timestamp = start.strftime("%Y%m%d_%H%M%S") + f"{start.microsecond / 1e6:.4f}"[1:]
@@ -57,7 +84,7 @@ def subsample_bam_parallel(
         threads = max(1, (multiprocessing.cpu_count() - 1))
     if contigs_to_parallelize_on == 0 or contigs_to_parallelize_on > threads:
         contigs_to_parallelize_on = threads
-    track_with_tqdm = True if (threads == 1 or verbose) else False
+    track_with_tqdm = True if (contigs_to_parallelize_on == 1 or verbose) else False
     reference_to_tmp_file_paths = dict()
     reference_job_outputs = list()
     try:
