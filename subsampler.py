@@ -96,15 +96,19 @@ def subsample_bam_parallel(
                 for reference in references
             }
             reference_to_read_counts: dict[str, int] = (
-                {reference: None for reference in references}
-                # {
-                #     reference: get_read_count(bamfile, reference=reference)
-                #     for reference, _ in tqdm.tqdm(
-                #         sorted(reference_to_lengths.items(), key=lambda ref_to_len: ref_to_len[1], reverse=True),
-                #         desc="Calculating read count per reference",
-                #         unit=" references"
-                #     )
-                # }
+                # {reference: None for reference in references}
+                {
+                    reference: get_read_count(bamfile, reference=reference)
+                    for reference, _ in tqdm.tqdm(
+                        sorted(
+                            reference_to_lengths.items(),
+                            key=lambda ref_to_len: ref_to_len[1],
+                            reverse=True
+                        ),
+                        desc="Calculating read count per reference",
+                        unit=" references"
+                    )
+                }
             )
             reference_to_tmp_file_paths = {
                 reference: Path(
@@ -143,6 +147,7 @@ def subsample_bam_parallel(
                     )
                 ),
                 key=lambda x: (x.read_count, x.reference_length, x.reference),
+                reverse=True,
             )
 
         logging.info(
@@ -152,15 +157,16 @@ def subsample_bam_parallel(
         if contigs_to_parallelize_on == 1:
             for job in args_list:
                 reference_job_outputs.append(process_reference(job))
-        with multiprocessing.Pool(
-            processes=min(threads, contigs_to_parallelize_on, len(references))
-        ) as pool:
-            for reference_job_output in tqdm.tqdm(
-                pool.imap_unordered(process_reference, args_list),
-                total=len(args_list),
-                desc="Processing references",
-            ):
-                reference_job_outputs.append(reference_job_output)
+        else:
+            with multiprocessing.Pool(
+                processes=min(threads, contigs_to_parallelize_on, len(references))
+            ) as pool:
+                for reference_job_output in tqdm.tqdm(
+                    pool.imap_unordered(process_reference, args_list),
+                    total=len(args_list),
+                    desc="Processing references",
+                ):
+                    reference_job_outputs.append(reference_job_output)
 
         logging.debug(f"Writing subsample reads to {output_bam}\n")
         with pysam.AlignmentFile(input_bam, "rb") as bamfile:
