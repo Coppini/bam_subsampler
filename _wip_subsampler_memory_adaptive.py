@@ -12,6 +12,7 @@ import time
 import tracemalloc
 from multiprocessing.pool import AsyncResult
 from pathlib import Path
+from shutil import move
 from typing import Iterable, NamedTuple
 
 import psutil
@@ -130,6 +131,8 @@ def subsample_bam_parallel(
     input_bam: Path,
     output_bam: Path,
     desired_coverage: int = DEFAULT_COVERAGE,
+    coverage_cap: int = 0,
+    large_coverage_matrix: bool = True,
     low_coverage_bases_to_prioritize: int = DEFAULT_LOW_COV_BASES_TO_PRIORITIZE,
     ignore_n_bases_on_edges: int = 0,
     seed: int = DEFAULT_SEED,
@@ -189,6 +192,8 @@ def subsample_bam_parallel(
                     read_count=reference_to_read_counts[reference],
                     input_bam_path=input_bam,
                     desired_coverage=desired_coverage,
+                    coverage_cap=coverage_cap,
+                    large_coverage_matrix=large_coverage_matrix,
                     low_coverage_bases_to_prioritize=low_coverage_bases_to_prioritize,
                     ignore_n_bases_on_edges=ignore_n_bases_on_edges,
                     seed=(seed + i),
@@ -241,12 +246,16 @@ def subsample_bam_parallel(
         with pysam.AlignmentFile(input_bam, "rb") as bamfile:
             header = bamfile.header
 
-        with pysam.AlignmentFile(output_bam, "wb", header=header) as final_bam:
-            for reference_job_output in reference_job_outputs:
-                with pysam.AlignmentFile(reference_job_output.temp_bam, "rb") as tmp_fh:
-                    for read in tmp_fh:
-                        final_bam.write(read)
-                if reference_job_output.temp_bam.exists:
+        if len(reference_job_outputs) == 1:
+            move(reference_job_outputs[0].temp_bam, output_bam)
+        else:
+            with pysam.AlignmentFile(output_bam, "wb", header=header) as final_bam:
+                for reference_job_output in reference_job_outputs:
+                    with pysam.AlignmentFile(
+                        reference_job_output.temp_bam, "rb"
+                    ) as tmp_fh:
+                        for read in tmp_fh:
+                            final_bam.write(read)
                     Path(reference_job_output.temp_bam).unlink()
         current, main_peak = tracemalloc.get_traced_memory()
         peak = main_peak + max(process.peak_memory for process in reference_job_outputs)
@@ -285,6 +294,23 @@ if __name__ == "__main__":
         default=DEFAULT_COVERAGE,
         help=f"Desired per-base coverage (default: {DEFAULT_COVERAGE}).",
     )
+    parser.add_argument(
+        "-l",
+        "--coverage-cap",
+        type=int,
+        default=0,
+        help=(
+            "Maximum coverage value to consider when finding low coverage positions."
+            " Anything equal or higher than this value is considered the same when sorting by coverage."
+            " (default: 0 for automatic detection based on desired coverage.)"
+        ),
+    )
+    # parser.add_argument(
+    #     "--large-coverage-matrix",
+    #     action="store_true",
+    #     default=False,
+    #     help="Forces the subsampler to use a large coverage matrix, which uses more RAM, but can be faster for high depth input BAMs.",
+    # )
     parser.add_argument(
         "-s",
         "--seed",
@@ -347,6 +373,8 @@ if __name__ == "__main__":
         input_bam=args.input_bam,
         output_bam=args.output_bam,
         desired_coverage=args.coverage,
+        coverage_cap=args.coverage_cap,
+        large_coverage_matrix=True,  # args.large_coverage_matrix,
         seed=args.seed,
         threads=args.threads,
         contigs_to_parallelize_on=(

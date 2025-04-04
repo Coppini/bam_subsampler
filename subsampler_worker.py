@@ -30,6 +30,8 @@ class ReferenceJobInput:
     read_count: int | None
     input_bam_path: str
     desired_coverage: int
+    coverage_cap: int
+    large_coverage_matrix: bool
     low_coverage_bases_to_prioritize: int
     ignore_n_bases_on_edges: int
     seed: int
@@ -133,6 +135,7 @@ def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
     reference: str,
     reference_length: int,
     coverage_cap: int,
+    large_coverage_matrix: bool,
     low_coverage_bases_to_prioritize: int,
     read_count: int | None = None,
     disable_tqdm: bool = False,
@@ -161,9 +164,11 @@ def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
         read_count = bamfile.count(reference=reference)
         bamfile.seek(0)
     read_hash_to_spans: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    # spans: list[tuple[int, int]]
+    # read_hash_to_span_index: dict[int, list[int, int]]
     coverage_array = np.zeros(
         reference_length,
-        dtype=(np.uint8 if coverage_cap < 255 else np.uint16),
+        dtype=(np.uint16 if large_coverage_matrix or coverage_cap >= 255 else np.uint8),
     )
     coverage_limiter = max(coverage_cap, (np.iinfo(coverage_array.dtype).max - 10))
     for read in tqdm.tqdm(
@@ -190,9 +195,8 @@ def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
             read_hash_to_spans[xxhash.xxh64(read.query_name).intdigest()].append(
                 (start, end)
             )
-            positions = np.arange(start, end)
-            coverage_array[positions] += 1
-            if coverage_array[positions].max() >= coverage_limiter:
+            coverage_array[start:end] += 1
+            if coverage_array[start:end].max() >= coverage_limiter:
                 coverage_array = np.minimum(
                     coverage_array, coverage_cap
                 )  # to avoid overflow
@@ -241,6 +245,8 @@ def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
             - read_count (int | None): Number of reads for this reference. If None, it will be counted.
             - input_bam_path (str): Path to the original input BAM file.
             - desired_coverage (int): Target per-base coverage to reach.
+            - coverage_cap (int): Maximum coverage value to consider per base. Anything equal or higher than this value is considered the same when sorting by coverage. 0 for automatic.
+            - large_coverage_matrix (bool): If True, forces the use of a large coverage matrix, which uses more RAM, but can be faster. If False, selection depends on coverage cap.
             - low_coverage_bases_to_prioritize (int): Number of lowest-coverage positions to use as sort priority per read.
             - ignore_n_bases_on_edges (int): Number of bases to ignore at the start and end of reads for coverage.
             - seed (int): Seed for reproducibility (used for shuffling reads with the same lowest coverages).
@@ -280,32 +286,36 @@ def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
         logging.info(
             f"Starting to subsample reference {args.reference} ({read_count} reads over {args.reference_length} positions)\n"
         )
-        coverage_cap = (
-            min(254, int(args.desired_coverage * 2))
-            if args.desired_coverage <= 200
-            else (args.desired_coverage * 1.5)
-        )
+        if args.coverage_cap == 0:
+            args.coverage_cap = args.desired_coverage * 2
         coverage_array = np.zeros(
-            args.reference_length, dtype=(np.uint8 if coverage_cap < 255 else np.uint16)
+            args.reference_length,
+            dtype=(
+                np.uint16
+                if args.large_coverage_matrix or args.coverage_cap >= 255
+                else np.uint8
+            ),
         )
         coverage_limiter = np.iinfo(coverage_array.dtype).max - 10
         selected_read_hashes = set()
-        sorted_read_hash_and_spans = get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
-            bamfile=bamfile,
-            reference=args.reference,
-            reference_length=args.reference_length,
-            coverage_cap=coverage_cap,
-            read_count=read_count,
-            disable_tqdm=disable_tqdm,
-            low_coverage_bases_to_prioritize=args.low_coverage_bases_to_prioritize,
-            tqdm_position=args.tqdm_position,
+        sorted_read_hash_and_spans = (
+            get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
+                bamfile=bamfile,
+                reference=args.reference,
+                reference_length=args.reference_length,
+                coverage_cap=args.coverage_cap,
+                large_coverage_matrix=args.large_coverage_matrix,
+                read_count=read_count,
+                disable_tqdm=disable_tqdm,
+                low_coverage_bases_to_prioritize=args.low_coverage_bases_to_prioritize,
+                tqdm_position=args.tqdm_position,
+            )
         )
         gc.collect()
         for read_hash, spans in tqdm.tqdm(
             sorted_read_hash_and_spans,
             desc=(f"Selecting reads for {args.reference}"),
             unit=" reads",
-            total=read_count / 2,
             disable=disable_tqdm,
             leave=True,
         ):
