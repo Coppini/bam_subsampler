@@ -24,9 +24,9 @@ logging.basicConfig(
 
 
 @dataclass
-class ReferenceJobInput:
-    reference: str
-    reference_length: int
+class ContigJobInput:
+    contig: str
+    contig_length: int
     read_count: int | None
     input_bam_path: str
     desired_coverage: int
@@ -43,8 +43,8 @@ class ReferenceJobInput:
 
 
 @dataclass
-class ReferenceJobOutput:
-    reference: str
+class ContigJobOutput:
+    contig: str
     temp_bam: Path
     peak_memory: int
 
@@ -104,7 +104,7 @@ def format_duration(delta: datetime.timedelta) -> str:
 def get_unique_positions(
     spans: list[tuple[int, int]],
     trim_n_bases: int = 0,
-    reference_length: int | None = None,
+    contig_length: int | None = None,
 ) -> np.ndarray:
     """
     Compute the unique genomic positions covered by a list of read spans.
@@ -112,7 +112,7 @@ def get_unique_positions(
     Args:
         spans (list[tuple[int, int]]): List of (start, end) read spans.
         trim_n_bases (int): Number of bases to trim from each end of a span.
-        reference_length (int | None): Length of the reference sequence.
+        contig_length (int | None): Length of the contig sequence.
 
     Returns:
         np.ndarray: Sorted array of unique positions.
@@ -122,7 +122,7 @@ def get_unique_positions(
             [
                 np.arange(
                     (start + trim_n_bases) if start != 0 else start,
-                    (end - trim_n_bases) if end != reference_length else end,
+                    (end - trim_n_bases) if end != contig_length else end,
                 )
                 for start, end in spans
             ]
@@ -132,26 +132,26 @@ def get_unique_positions(
 
 def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
     bamfile: pysam.AlignmentFile,
-    reference: str,
-    reference_length: int,
+    contig: str,
+    contig_length: int,
     coverage_cap: int,
-    large_coverage_matrix: bool,
-    low_coverage_bases_to_prioritize: int,
+    large_coverage_matrix: bool = True,
+    low_coverage_bases_to_prioritize: int = 10,
     read_count: int | None = None,
     disable_tqdm: bool = False,
     tqdm_position: int = 0,
-) -> list[tuple[int, list[tuple[int, int]]]]:
+) -> list[tuple[bytes, list[tuple[int, int]]]]:
     """
-    Iterates through reads of a given reference in the BAM file, collects their spans,
-    builds a coverage array across the reference, and yields read spans sorted by
+    Iterates through reads of a given contig in the BAM file, collects their spans,
+    builds a coverage array across the contig, and yields read spans sorted by
     increasing coverage (prioritizing under-covered regions).
 
     Args:
         bamfile (pysam.AlignmentFile): Opened BAM file object.
-        reference (str): The name of the reference (contig) to process.
-        reference_length (int): Length of the reference sequence.
+        contig (str): The name of the contig/reference to process.
+        contig_length (int): Length of the contig sequence.
         coverage_cap (int): Maximum coverage value to consider per base. Anything equal or higher than this value is considered the same when sorting by coverage.
-        read_count (int | None): Number of reads in the reference. If None, it will be counted.
+        read_count (int | None): Number of reads in the contig. If None, it will be counted.
         disable_tqdm (bool): If True, disables the tqdm progress bars.
         low_coverage_bases_to_prioritize (int): Number of lowest-coverage positions to use as sort priority per read.
         tqdm_position (int): Vertical position of the tqdm bar in the terminal (for multi-bar display).
@@ -161,23 +161,25 @@ def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
     """
     bamfile.seek(0)
     if read_count is None:
-        read_count = bamfile.count(reference=reference)
+        read_count = bamfile.count(contig=contig)
         bamfile.seek(0)
-    read_hash_to_spans: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    read_hash_to_spans: dict[bytes, list[tuple[int, int]]] = defaultdict(list)
     # spans: list[tuple[int, int]]
     # read_hash_to_span_index: dict[int, list[int, int]]
+    dtype=(np.uint16 if (large_coverage_matrix or coverage_cap >= 255) else np.uint8)
     coverage_array = np.zeros(
-        reference_length,
-        dtype=(np.uint16 if large_coverage_matrix or coverage_cap >= 255 else np.uint8),
+        contig_length,
+        dtype=dtype,
     )
-    coverage_limiter = max(coverage_cap, (np.iinfo(coverage_array.dtype).max - 10))
+    dtype_max = np.iinfo(dtype).max
+    coverage_limiter = max(coverage_cap, (np.iinfo(dtype).max - 10))
     for read in tqdm.tqdm(
         bamfile.fetch(
-            reference=reference,
+            contig=contig,
             multiple_iterators=(True if bamfile.threads > 1 else False),
         ),
         total=read_count,
-        desc=f"Indexing {reference}{f' with {bamfile.threads} threads' if bamfile.threads > 1 else ''}",
+        desc=f"Indexing {contig}{f' with {bamfile.threads} threads' if bamfile.threads > 1 else ''}",
         unit=" reads",
         position=tqdm_position,
         disable=disable_tqdm,
@@ -192,7 +194,7 @@ def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
             continue
         length = end - start
         if length:
-            read_hash_to_spans[xxhash.xxh64(read.query_name).intdigest()].append(
+            read_hash_to_spans[xxhash.xxh64(read.query_name).digest()].append(
                 (start, end)
             )
             coverage_array[start:end] += 1
@@ -203,27 +205,29 @@ def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
 
     coverage_array = np.minimum(coverage_array, coverage_cap)
     total_hashes = len(read_hash_to_spans)
-    random_ceil = coverage_cap + (total_hashes * 10)
+    random_part_length = int(np.ceil(np.log(coverage_cap + total_hashes * 10) / np.log(dtype_max)))
 
     with tqdm.tqdm(
         total=total_hashes,
-        desc=f"Sorting read pairs by the {low_coverage_bases_to_prioritize} positions with lowest coverages for {reference}",
+        desc=f"Sorting read pairs by the {low_coverage_bases_to_prioritize} positions with lowest coverages for {contig}",
         disable=disable_tqdm,
         unit=" read pairs",
         position=tqdm_position,
         leave=True,
     ) as sorting_bar:
 
-        def coverage_vector(spans: list[tuple[int, int]]) -> tuple[int, ...]:
-            coverages = tuple(
+        def coverage_vector(spans: list[tuple[int, int]]) -> bytes:
+            coverages = np.array(
                 heapq.nsmallest(
                     low_coverage_bases_to_prioritize,
                     coverage_array[get_unique_positions(spans)],
-                )
-                + [random.randint(coverage_cap, random_ceil)]
+                ) 
+                + [dtype_max]
+                + [random.randint(0, dtype_max) for _ in range(random_part_length)],
+                dtype=dtype,
             )
             sorting_bar.update(1)
-            return coverages
+            return coverages.tobytes()
 
         return sorted(
             read_hash_to_spans.items(),
@@ -231,18 +235,18 @@ def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
         )
 
 
-def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
+def process_contig(args: ContigJobInput) -> ContigJobOutput:
     """
-    Process a single reference (contig) from a BAM file:
+    Process a single contig/reference from a BAM file:
     - Selects reads to match a target per-base coverage.
     - Prioritizes reads that cover underrepresented regions.
     - Writes selected reads to a temporary BAM file.
 
     Args:
-        args (ReferenceJobInput): Job configuration and metadata for processing the contig.
-            - reference (str): Name of the reference/contig.
-            - reference_length (int): Length of the reference sequence.
-            - read_count (int | None): Number of reads for this reference. If None, it will be counted.
+        args (ContigJobInput): Job configuration and metadata for processing the contig.
+            - contig (str): Name of the contig/reference.
+            - contig_length (int): Length of the contig sequence.
+            - read_count (int | None): Number of reads for this contig. If None, it will be counted.
             - input_bam_path (str): Path to the original input BAM file.
             - desired_coverage (int): Target per-base coverage to reach.
             - coverage_cap (int): Maximum coverage value to consider per base. Anything equal or higher than this value is considered the same when sorting by coverage. 0 for automatic.
@@ -257,7 +261,7 @@ def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
             - track_with_tqdm (bool): Whether to display tqdm progress bars.
 
     Returns:
-        ReferenceJobOutput: Metadata for the result, including the reference name,
+        ContigJobOutput: Metadata for the result, including the contig name,
         path to the temporary output BAM, and peak memory used during the process.
     """
     start_time = datetime.datetime.now()
@@ -265,7 +269,7 @@ def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
         tracemalloc.start()
     else:
         peak = 0
-    logging.debug(f"Starting to process reference {args.reference}")
+    logging.debug(f"Starting to process contig {args.contig}")
     disable_tqdm = not args.track_with_tqdm
     random.seed(args.seed)
     with (
@@ -277,22 +281,22 @@ def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
         read_count = (
             args.read_count
             if args.read_count is not None
-            else bamfile.count(reference=args.reference)
+            else bamfile.count(contig=args.contig)
         )
         if read_count == 0:
             current, peak = tracemalloc.get_traced_memory()
             tracemalloc.stop()
-            return ReferenceJobOutput(args.reference, args.tmp_file_path, peak)
+            return ContigJobOutput(args.contig, args.tmp_file_path, peak)
         logging.info(
-            f"Starting to subsample reference {args.reference} ({read_count} reads over {args.reference_length} positions)\n"
+            f"Starting to subsample contig {args.contig} ({read_count} reads over {args.contig_length} positions)\n"
         )
         if args.coverage_cap == 0:
             args.coverage_cap = args.desired_coverage * 2
         coverage_array = np.zeros(
-            args.reference_length,
+            args.contig_length,
             dtype=(
                 np.uint16
-                if args.large_coverage_matrix or args.coverage_cap >= 255
+                if (args.large_coverage_matrix or args.coverage_cap >= 255)
                 else np.uint8
             ),
         )
@@ -301,8 +305,8 @@ def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
         sorted_read_hash_and_spans = (
             get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
                 bamfile=bamfile,
-                reference=args.reference,
-                reference_length=args.reference_length,
+                contig=args.contig,
+                contig_length=args.contig_length,
                 coverage_cap=args.coverage_cap,
                 large_coverage_matrix=args.large_coverage_matrix,
                 read_count=read_count,
@@ -314,7 +318,7 @@ def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
         gc.collect()
         for read_hash, spans in tqdm.tqdm(
             sorted_read_hash_and_spans,
-            desc=(f"Selecting reads for {args.reference}"),
+            desc=(f"Selecting reads for {args.contig}"),
             unit=" reads",
             disable=disable_tqdm,
             leave=True,
@@ -322,7 +326,7 @@ def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
             positions = get_unique_positions(
                 spans,
                 trim_n_bases=args.ignore_n_bases_on_edges,
-                reference_length=args.reference_length,
+                contig_length=args.contig_length,
             )
             if np.any(coverage_array[positions] < args.desired_coverage):
                 selected_read_hashes.add(read_hash)
@@ -334,22 +338,22 @@ def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
         if not selected_read_hashes:
             current, peak = tracemalloc.get_traced_memory()
             tracemalloc.stop()
-            return ReferenceJobOutput(args.reference, args.tmp_file_path, peak)
+            return ContigJobOutput(args.contig, args.tmp_file_path, peak)
         bamfile.seek(0)
         total_output_reads = 0
         for read in tqdm.tqdm(
             bamfile.fetch(
-                reference=args.reference,
+                contig=args.contig,
                 multiple_iterators=(True if bamfile.threads > 1 else False),
             ),
             total=read_count,
-            desc=f"Writing {args.reference}{f' with {bamfile.threads} threads' if bamfile.threads > 1 else ''}",
+            desc=f"Writing {args.contig}{f' with {bamfile.threads} threads' if bamfile.threads > 1 else ''}",
             disable=disable_tqdm,
             leave=True,
             unit=" reads",
             position=args.tqdm_position,
         ):
-            if xxhash.xxh64(read.query_name).intdigest() in selected_read_hashes:
+            if xxhash.xxh64(read.query_name).digest() in selected_read_hashes:
                 output_fh.write(read)
                 total_output_reads += 1
     del selected_read_hashes
@@ -358,12 +362,12 @@ def process_reference(args: ReferenceJobInput) -> ReferenceJobOutput:
         current, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
         logging.info(
-            f"Done subsampling reference {args.reference} ({total_output_reads}/{read_count} = {total_output_reads / read_count * 100:.2f}%)"
+            f"Done subsampling contig {args.contig} ({total_output_reads}/{read_count} = {total_output_reads / read_count * 100:.2f}%)"
             f" [Time: {format_duration(datetime.datetime.now() - start_time)}] "
             f" [Peak memory usage: {format_memory(peak)}]\n"
         )
     else:
         logging.info(
-            f"Done subsampling reference {args.reference} ({total_output_reads}/{read_count} = {total_output_reads / read_count * 100:.2f}%)\n"
+            f"Done subsampling contig {args.contig} ({total_output_reads}/{read_count} = {total_output_reads / read_count * 100:.2f}%)\n"
         )
-    return ReferenceJobOutput(args.reference, args.tmp_file_path, peak)
+    return ContigJobOutput(args.contig, args.tmp_file_path, peak)

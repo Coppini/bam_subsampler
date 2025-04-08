@@ -20,11 +20,11 @@ import pysam
 import tqdm
 
 from subsampler_worker import (
-    ReferenceJobInput,
-    ReferenceJobOutput,
+    ContigJobInput,
+    ContigJobOutput,
     format_duration,
     format_memory,
-    process_reference,
+    process_contig,
 )
 
 DEFAULT_COVERAGE = 50
@@ -34,7 +34,7 @@ DEFAULT_LOW_COV_BASES_TO_PRIORITIZE = 10
 
 
 class AsyncJob(NamedTuple):
-    job_input: ReferenceJobInput
+    job_input: ContigJobInput
     async_result: AsyncResult
 
 
@@ -45,9 +45,9 @@ logging.basicConfig(
 )
 
 
-def get_read_count(bamfile: Path, reference: str) -> int:
+def get_read_count(bamfile: Path, contig: str) -> int:
     bamfile.seek(0)
-    read_count = bamfile.count(reference=reference)
+    read_count = bamfile.count(contig=contig)
     bamfile.seek(0)
     return read_count
 
@@ -76,19 +76,19 @@ def get_used_memory_gb() -> float:
 
 def adaptive_parallel_run(
     pool,
-    jobs: list[ReferenceJobInput],
+    jobs: list[ContigJobInput],
     threads: int,
     contigs_to_parallelize_on: int,
     max_memory_gb: float | None = None,
     check_interval: datetime.timedelta = datetime.timedelta(seconds=1),
-) -> Iterable[ReferenceJobOutput]:
+) -> Iterable[ContigJobOutput]:
     active: list[AsyncJob] = list()
-    pending: list[ReferenceJobInput] = jobs.copy()
+    pending: list[ContigJobInput] = jobs.copy()
     completed_bar = tqdm.tqdm(
-        total=len(jobs), desc="Processing references", unit=" references"
+        total=len(jobs), desc="Processing contigs", unit=" contigs"
     )
     with tqdm.tqdm(
-        total=len(jobs), desc="Processing references", unit=" references"
+        total=len(jobs), desc="Processing contigs", unit=" contigs"
     ) as completed_bar:
         while pending or active:
             threads_in_use = max(
@@ -113,14 +113,14 @@ def adaptive_parallel_run(
                     or (0 < get_used_memory_gb() < max_memory_gb)
                 )
             ):
-                job: ReferenceJobInput = pending.pop(0)
+                job: ContigJobInput = pending.pop(0)
                 if available_threads > available_slots:
                     job.threads = max(
                         2, job.threads, available_threads // available_slots
                     )
                 async_result = AsyncJob(
                     job_input=job,
-                    async_result=pool.apply_async(process_reference, (job,)),
+                    async_result=pool.apply_async(process_contig, (job,)),
                 )
                 active.append(async_result)
             else:
@@ -156,40 +156,40 @@ def subsample_bam_parallel(
             f"{contigs_to_parallelize_on=} (should be greater or equal to 0)"
         )
     track_with_tqdm = True if (contigs_to_parallelize_on == 1 or verbose) else False
-    reference_job_outputs = list()
-    reference_to_tmp_file_paths = dict()
+    contig_job_outputs = list()
+    contig_to_tmp_file_paths = dict()
     try:
         with pysam.AlignmentFile(input_bam, "rb", threads=threads) as bamfile:
-            references = bamfile.references
-            logging.debug(f"{len(references)} references found in the BAM file.\n")
-            reference_to_lengths: dict[str, int] = {
-                reference: bamfile.get_reference_length(reference)
-                for reference in references
+            contigs = bamfile.references
+            logging.debug(f"{len(contigs)} contigs found in the BAM file.\n")
+            contig_to_lengths: dict[str, int] = {
+                contig: bamfile.get_contig_length(contig)
+                for contig in contigs
             }
-            reference_to_read_counts: dict[str, int] = (
-                {reference: None for reference in references}
+            contig_to_read_counts: dict[str, int] = (
+                {contig: None for contig in contigs}
                 # {
-                #     reference: get_read_count(bamfile, reference=reference)
-                #     for reference, _ in tqdm.tqdm(
-                #         sorted(reference_to_lengths.items(), key=lambda ref_to_len: ref_to_len[1], reverse=True),
-                #         desc="Calculating read count per reference",
-                #         unit=" references"
+                #     contig: get_read_count(bamfile, contig=contig)
+                #     for contig, _ in tqdm.tqdm(
+                #         sorted(contig_to_lengths.items(), key=lambda ref_to_len: ref_to_len[1], reverse=True),
+                #         desc="Calculating read count per contig",
+                #         unit=" contigs"
                 #     )
                 # }
             )
-            reference_to_tmp_file_paths = {
-                reference: Path(
+            contig_to_tmp_file_paths = {
+                contig: Path(
                     tempfile.NamedTemporaryFile(
-                        delete=False, prefix=f"{timestamp}.{reference}.", suffix=f".bam"
+                        delete=False, prefix=f"{timestamp}.{contig}.", suffix=f".bam"
                     ).name
                 )
-                for reference in references
+                for contig in contigs
             }
             args_list = [
-                ReferenceJobInput(
-                    reference=reference,
-                    reference_length=reference_to_lengths[reference],
-                    read_count=reference_to_read_counts[reference],
+                ContigJobInput(
+                    contig=contig,
+                    contig_length=contig_to_lengths[contig],
+                    read_count=contig_to_read_counts[contig],
                     input_bam_path=input_bam,
                     desired_coverage=desired_coverage,
                     coverage_cap=coverage_cap,
@@ -197,11 +197,11 @@ def subsample_bam_parallel(
                     low_coverage_bases_to_prioritize=low_coverage_bases_to_prioritize,
                     ignore_n_bases_on_edges=ignore_n_bases_on_edges,
                     seed=(seed + i),
-                    tmp_file_path=reference_to_tmp_file_paths[reference],
+                    tmp_file_path=contig_to_tmp_file_paths[contig],
                     profile=True,
                     threads=max(
                         1,
-                        threads // min(len(references), contigs_to_parallelize_on),
+                        threads // min(len(contigs), contigs_to_parallelize_on),
                     ),
                     track_with_tqdm=track_with_tqdm,
                     tqdm_position=(
@@ -210,12 +210,12 @@ def subsample_bam_parallel(
                         else None
                     ),
                 )
-                for i, reference in enumerate(
+                for i, contig in enumerate(
                     sorted(
-                        references,
+                        contigs,
                         key=lambda ref: (
-                            reference_to_read_counts[ref],
-                            reference_to_lengths[ref],
+                            contig_to_read_counts[ref],
+                            contig_to_lengths[ref],
                             ref,
                         ),
                     )
@@ -224,7 +224,7 @@ def subsample_bam_parallel(
 
         if contigs_to_parallelize_on == 1:
             for job in args_list:
-                reference_job_outputs.append(process_reference(job))
+                contig_job_outputs.append(process_contig(job))
         else:
             with multiprocessing.Pool(
                 processes=min(threads, contigs_to_parallelize_on)
@@ -241,41 +241,41 @@ def subsample_bam_parallel(
                     ),
                     check_interval=check_interval,
                 ):
-                    reference_job_outputs.append(result)
+                    contig_job_outputs.append(result)
 
         with pysam.AlignmentFile(input_bam, "rb") as bamfile:
             header = bamfile.header
 
-        if len(reference_job_outputs) == 1:
-            move(reference_job_outputs[0].temp_bam, output_bam)
+        if len(contig_job_outputs) == 1:
+            move(contig_job_outputs[0].temp_bam, output_bam)
         else:
             with pysam.AlignmentFile(output_bam, "wb", header=header) as final_bam:
-                for reference_job_output in reference_job_outputs:
+                for contig_job_output in contig_job_outputs:
                     with pysam.AlignmentFile(
-                        reference_job_output.temp_bam, "rb"
+                        contig_job_output.temp_bam, "rb"
                     ) as tmp_fh:
                         for read in tmp_fh:
                             final_bam.write(read)
-                    Path(reference_job_output.temp_bam).unlink()
+                    Path(contig_job_output.temp_bam).unlink()
         current, main_peak = tracemalloc.get_traced_memory()
-        peak = main_peak + max(process.peak_memory for process in reference_job_outputs)
+        peak = main_peak + max(process.peak_memory for process in contig_job_outputs)
         logging.info("Done subsampling.")
         logging.info(
             f"It took {format_duration(datetime.datetime.now() - start)} time to run."
         )
-        logging.debug(f"Peak memory usage in a SINGLE reference: {format_memory(peak)}")
+        logging.debug(f"Peak memory usage in a SINGLE contig: {format_memory(peak)}")
         return output_bam
     except:
         logging.warning("Interrupted! Cleaning up temporary files...")
         current, main_peak = tracemalloc.get_traced_memory()
-        peak = main_peak + sum(process.peak_memory for process in reference_job_outputs)
+        peak = main_peak + sum(process.peak_memory for process in contig_job_outputs)
         logging.warning(
             f"It took {format_duration(datetime.datetime.now() - start)} time to run before the exception."
         )
         logging.warning(
-            f"Peak memory usage in a single reference: {format_memory(peak)}"
+            f"Peak memory usage in a single contig: {format_memory(peak)}"
         )
-        for tmp_file_path in reference_to_tmp_file_paths.values():
+        for tmp_file_path in contig_to_tmp_file_paths.values():
             if tmp_file_path.exists():
                 tmp_file_path.unlink()
         raise
