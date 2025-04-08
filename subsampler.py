@@ -149,7 +149,15 @@ def subsample_bam_parallel(
                         ),
                     )
                     for i, reference in enumerate(
-                        list(reference_to_tmp_file_paths.keys())
+                        sorted(
+                            references,
+                            key=lambda ref: (
+                                reference_to_read_counts[ref],
+                                reference_to_lengths[ref],
+                                ref,
+                            ),
+                            reverse=True,
+                        )
                     )
                 ),
                 key=lambda x: (x.read_count, x.reference_length, x.reference),
@@ -190,11 +198,11 @@ def subsample_bam_parallel(
                             final_bam.write(read)
                     Path(reference_job_output.temp_bam).unlink()
         current, main_peak = tracemalloc.get_traced_memory()
-        peak = main_peak + sum(process.peak_memory for process in reference_job_outputs)
+        peak = main_peak + sum(sorted((process.peak_memory for process in reference_job_outputs), reverse=True)[:min(threads, contigs_to_parallelize_on)])
         logging.info(
             "Done subsampling.\n"
             f"It took {format_duration(datetime.datetime.now() - start)} time to run.\n"
-            f"Peak memory usage: {format_memory(peak)}\n"
+            f"Possible peak memory usage: {format_memory(peak)}\n"
         )
         return output_bam
     except:
@@ -235,7 +243,6 @@ if __name__ == "__main__":
             "Maximum coverage value to consider when finding low coverage positions."
             " Anything equal or higher than this value is considered the same when sorting by coverage."
             " (default: 0 for automatically using 2x desired coverage.)"
-            " Values above 254 use more RAM as it requires a larger coverage matrix (but are faster)"
         ),
     )
     # parser.add_argument(
