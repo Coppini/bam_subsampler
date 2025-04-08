@@ -17,7 +17,7 @@ It aims to retain sufficient read depth at every position while minimizing data 
 
 Install dependencies with `pip`:
 ```bash
-pip install pysam tqdm
+pip install -r requirements.txt
 ```
 
 ---
