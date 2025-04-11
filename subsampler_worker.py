@@ -2,14 +2,12 @@
 
 import datetime
 import gc
-import heapq
 import logging
 import random
 import tracemalloc
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Generator
+from typing import Generator, TypeVar
 
 import numpy as np
 import pysam
@@ -40,11 +38,14 @@ class ContigJobInput:
     threads: int
     tqdm_position: int
     track_with_tqdm: bool
+    start: datetime.datetime
 
 
 @dataclass
 class ContigJobOutput:
     contig: str
+    start: datetime.datetime
+    end: datetime.datetime
     temp_bam: Path
     peak_memory: int
 
@@ -64,13 +65,16 @@ def format_memory(bytes_amount: int) -> str:
     Returns:
         str: Human-readable memory size string.
     """
-    gb = bytes_amount / 10**9
+    tb = bytes_amount / (1024**4)
+    if tb >= 1:
+        return f"{tb:.2f} TB"
+    gb = bytes_amount / (1024**3)
     if gb >= 1:
         return f"{gb:.2f} GB"
-    mb = bytes_amount / 10**6
+    mb = bytes_amount / (1024**2)
     if mb >= 1:
         return f"{mb:.2f} MB"
-    kb = bytes_amount / 10**3
+    kb = bytes_amount / (1024)
     if kb >= 1:
         return f"{kb:.2f} KB"
     return f"{bytes_amount} B"
@@ -101,49 +105,71 @@ def format_duration(delta: datetime.timedelta) -> str:
     return " ".join(parts)
 
 
-def get_unique_positions(
-    spans: list[tuple[int, int]],
+def get_positions(
+    spans: np.ndarray,
     trim_n_bases: int = 0,
     contig_length: int | None = None,
 ) -> np.ndarray:
     """
-    Compute the unique genomic positions covered by a list of read spans.
+    Compute the unique genomic positions covered by a list of read slices.
 
     Args:
-        spans (list[tuple[int, int]]): List of (start, end) read spans.
-        trim_n_bases (int): Number of bases to trim from each end of a span.
+        slices (list[slice]): List of read slices (start, end).
+        trim_n_bases (int): Number of bases to trim from each end of a slice.
         contig_length (int | None): Length of the contig sequence.
 
     Returns:
         np.ndarray: Sorted array of unique positions.
     """
-    return np.unique(
-        np.concatenate(
+    if trim_n_bases:
+        return np.concatenate(
             [
                 np.arange(
-                    (start + trim_n_bases) if start != 0 else start,
-                    (end - trim_n_bases) if end != contig_length else end,
+                    ((start + trim_n_bases) if start != 0 else start),
+                    ((stop - trim_n_bases) if stop != contig_length else stop),
                 )
-                for start, end in spans
+                for (start, stop) in spans
             ]
         )
+    return np.concatenate(
+        [np.arange(spans[0][0], spans[0][1]), np.arange(spans[1][0], spans[1][1])]
     )
 
 
-def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
+def smallest_possible_uint_dtype(min_value: int) -> np.dtype:
+    for dtype in (np.uint8, np.uint16, np.uint32, np.uint64):
+        if np.iinfo(dtype).max >= min_value:
+            return dtype
+    raise ValueError(f"No suitable unsigned integer dtype for value {min_value}")
+
+
+K = TypeVar("K")
+V = TypeVar("V")
+
+
+def pop_items_from_dictionary(
+    d: dict[K, V], random_order: bool = False
+) -> Generator[tuple[K, V], None, None]:
+    for key in (
+        random.sample(list(d.keys()), len(d)) if random_order else list(d.keys())
+    ):
+        yield key, d.pop(key)
+
+
+def get_read_hashes_to_spans_by_lower_to_higher_coverage(
     bamfile: pysam.AlignmentFile,
     contig: str,
     contig_length: int,
-    coverage_cap: int,
-    large_coverage_matrix: bool = True,
-    low_coverage_bases_to_prioritize: int = 10,
-    read_count: int | None = None,
+    desired_coverage: int,
+    coverage_cap: int = 0,
+    low_coverage_bases_to_prioritize: int = True,
+    read_count: int = 0,
     disable_tqdm: bool = False,
     tqdm_position: int = 0,
-) -> list[tuple[bytes, list[tuple[int, int]]]]:
+) -> dict[bytes, np.ndarray]:
     """
-    Iterates through reads of a given contig in the BAM file, collects their spans,
-    builds a coverage array across the contig, and yields read spans sorted by
+    Iterates through reads of a given contig in the BAM file, collects their slices,
+    builds a coverage array across the contig, and yields read slices sorted by
     increasing coverage (prioritizing under-covered regions).
 
     Args:
@@ -151,28 +177,32 @@ def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
         contig (str): The name of the contig/reference to process.
         contig_length (int): Length of the contig sequence.
         coverage_cap (int): Maximum coverage value to consider per base. Anything equal or higher than this value is considered the same when sorting by coverage.
-        read_count (int | None): Number of reads in the contig. If None, it will be counted.
+        read_count (int): Number of reads in the contig. If 0, it will be counted.
         disable_tqdm (bool): If True, disables the tqdm progress bars.
         low_coverage_bases_to_prioritize (int): Number of lowest-coverage positions to use as sort priority per read.
         tqdm_position (int): Vertical position of the tqdm bar in the terminal (for multi-bar display).
 
     Returns:
-        list: List of (read_hash, spans) sorted by coverage priority.
+        hashes_to_spans (dict[bytes, np.ndarray]): A dictionary of {read_hash: spans} sorted by coverage priority, from lowest coverage to highest.
+                              spans (np.ndarray): has shape=(2,2), as [[start_read1, stop_read1], [start_read2, stop_read2]]
     """
     bamfile.seek(0)
-    if read_count is None:
+    if not read_count:
         read_count = bamfile.count(contig=contig)
         bamfile.seek(0)
-    read_hash_to_spans: dict[bytes, list[tuple[int, int]]] = defaultdict(list)
-    # spans: list[tuple[int, int]]
-    # read_hash_to_span_index: dict[int, list[int, int]]
-    dtype=(np.uint16 if (large_coverage_matrix or coverage_cap >= 255) else np.uint8)
+    if not coverage_cap:
+        coverage_cap = desired_coverage + 1
+    position_array_dtype = smallest_possible_uint_dtype(contig_length)
+    coverage_array_dtype = smallest_possible_uint_dtype(
+        max(np.iinfo(np.uint16).max, coverage_cap + 10, coverage_cap * 2)
+    )
+    hash_to_spans: dict[bytes, np.ndarray] = dict()
+    coverage_array_dtype_max = np.iinfo(coverage_array_dtype).max
+    coverage_limiter = coverage_array_dtype_max - 10
     coverage_array = np.zeros(
         contig_length,
-        dtype=dtype,
+        dtype=coverage_array_dtype,
     )
-    dtype_max = np.iinfo(dtype).max
-    coverage_limiter = max(coverage_cap, (np.iinfo(dtype).max - 10))
     for read in tqdm.tqdm(
         bamfile.fetch(
             contig=contig,
@@ -187,28 +217,84 @@ def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
     ):
         if not read.is_proper_pair:
             continue
-        try:
-            start = min(read.reference_start, read.reference_end)
-            end = max(read.reference_start, read.reference_end)
-        except TypeError:
+        start = read.reference_start
+        stop = read.reference_end
+        if stop < start:
+            start, stop = stop, start
+        elif stop == start:
             continue
-        length = end - start
-        if length:
-            read_hash_to_spans[xxhash.xxh64(read.query_name).digest()].append(
-                (start, end)
+        read_hash = xxhash.xxh64(read.query_name).digest()
+        span = hash_to_spans.get(read_hash)
+        if span is None:
+            hash_to_spans[read_hash] = np.array(
+                [[start, stop], [0, 0]], dtype=position_array_dtype
             )
-            coverage_array[start:end] += 1
-            if coverage_array[start:end].max() >= coverage_limiter:
-                coverage_array = np.minimum(
-                    coverage_array, coverage_cap
-                )  # to avoid overflow
-
+        else:
+            span[1] = [start, stop]
+        span_slice = slice(start, stop)
+        coverage_array[span_slice] += 1
+        if coverage_array[span_slice].max() >= coverage_limiter:
+            logging.debug(
+                f"Coverage above max value of {coverage_array_dtype_max} will be capped at read spanning {contig}:{span_slice.start}-{span_slice.stop}",
+                extra={"region": contig},
+            )
+            coverage_array = np.minimum(coverage_array, coverage_cap)
+    current, peak = tracemalloc.get_traced_memory()
+    logging.debug(
+        f" 3 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+        extra={"region": contig},
+    )
+    gc.collect()
     coverage_array = np.minimum(coverage_array, coverage_cap)
-    total_hashes = len(read_hash_to_spans)
-    random_part_length = int(np.ceil(np.log(coverage_cap + total_hashes * 10) / np.log(dtype_max)))
+    minimum_dtype_required = smallest_possible_uint_dtype(coverage_array.max())
+    if (
+        coverage_array_dtype_max
+        > np.iinfo(minimum_dtype_required).max
+        >= coverage_array.max()
+    ):
+        coverage_array = coverage_array.astype(minimum_dtype_required)
+        coverage_array_dtype = minimum_dtype_required
+        coverage_array_dtype_max = np.iinfo(minimum_dtype_required).max
+    logging.info(
+        f"Using {coverage_array_dtype} with max {coverage_array_dtype_max}",
+        extra={"region": contig},
+    )
+    gc.collect()
+    current, peak = tracemalloc.get_traced_memory()
+    logging.debug(
+        f" 4 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+        extra={"region": contig},
+    )
+    hash_to_spans = dict(
+        tqdm.tqdm(
+            pop_items_from_dictionary(hash_to_spans, random_order=True),
+            total=len(hash_to_spans),
+            desc="Shuffling read hashes to remove position biases",
+            disable=disable_tqdm,
+            unit=" hashes",
+            position=tqdm_position,
+            leave=True,
+        )
+    )
+    current, peak = tracemalloc.get_traced_memory()
+    logging.debug(
+        f" 5 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+        extra={"region": contig},
+    )
+    gc.collect()
 
+    random_part_length = int(
+        np.ceil(
+            np.log(coverage_cap + len(hash_to_spans)) / np.log(coverage_array_dtype_max)
+        )
+    )
+    current, peak = tracemalloc.get_traced_memory()
+    logging.info(
+        f" 6 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+        extra={"region": contig},
+    )
     with tqdm.tqdm(
-        total=total_hashes,
+        total=len(hash_to_spans),
         desc=f"Sorting read pairs by the {low_coverage_bases_to_prioritize} positions with lowest coverages for {contig}",
         disable=disable_tqdm,
         unit=" read pairs",
@@ -216,23 +302,119 @@ def get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
         leave=True,
     ) as sorting_bar:
 
-        def coverage_vector(spans: list[tuple[int, int]]) -> bytes:
-            coverages = np.array(
-                heapq.nsmallest(
-                    low_coverage_bases_to_prioritize,
-                    coverage_array[get_unique_positions(spans)],
-                ) 
-                + [dtype_max]
-                + [random.randint(0, dtype_max) for _ in range(random_part_length)],
-                dtype=dtype,
+        def coverage_vector(spans: np.ndarray) -> bytes:
+            coverages = np.concatenate(
+                [
+                    coverage_array[spans[0][0] : spans[0][1]],
+                    coverage_array[spans[1][0] : spans[1][1]],
+                ]
             )
-            sorting_bar.update(1)
-            return coverages.tobytes()
+            try:
+                coverages = np.partition(coverages, low_coverage_bases_to_prioritize)[
+                    :low_coverage_bases_to_prioritize
+                ]
+            except ValueError:
+                coverages = np.pad(
+                    coverages,
+                    (0, (low_coverage_bases_to_prioritize - len(coverages))),
+                    mode="constant",
+                    constant_values=coverage_array_dtype_max,
+                )
+            coverages.sort()
 
-        return sorted(
-            read_hash_to_spans.items(),
-            key=lambda rh_2_s: coverage_vector(rh_2_s[1]),
+            sorting_bar.update(1)
+
+            if coverages[0] <= desired_coverage:
+                return coverages.tobytes()
+            return np.concatenate(
+                [
+                    coverages,
+                    np.array(
+                        [
+                            random.randint(0, coverage_array_dtype_max)
+                            for _ in range(random_part_length)
+                        ],
+                        dtype=coverage_array_dtype,
+                    ),
+                ]
+            ).tobytes()
+
+        current, peak = tracemalloc.get_traced_memory()
+        logging.debug(
+            f" 7 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+            extra={"region": contig},
         )
+        return dict(
+            sorted(
+                pop_items_from_dictionary(hash_to_spans),
+                key=lambda rh2s: coverage_vector(rh2s[1]),
+            )
+        )
+
+
+def select_reads(
+    sorted_read_hash_and_spans: dict[bytes, np.ndarray],
+    contig: str,
+    contig_length: int,
+    desired_coverage: int,
+    coverage_cap: int,
+    ignore_n_bases_on_edges: int = 0,
+    large_coverage_matrix: bool = True,
+    disable_tqdm: bool = False,
+    tqdm_position: int = 0,
+) -> Generator[bytes, None, None]:
+    current, peak = tracemalloc.get_traced_memory()
+    logging.debug(
+        f" 10 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+        extra={"region": contig},
+    )
+    coverage_array = np.zeros(
+        contig_length,
+        dtype=(
+            np.uint16
+            if (large_coverage_matrix or coverage_cap >= (np.iinfo(np.uint8).max - 10))
+            else np.uint8
+        ),
+    )
+    coverage_limiter = np.iinfo(coverage_array.dtype).max - 10
+    current, peak = tracemalloc.get_traced_memory()
+    logging.debug(
+        f" 11 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+        extra={"region": contig},
+    )
+    for read_hash, spans in tqdm.tqdm(
+        pop_items_from_dictionary(sorted_read_hash_and_spans, random_order=False),
+        total=len(sorted_read_hash_and_spans),
+        desc=(f"Selecting reads for {contig}"),
+        unit=" reads",
+        disable=disable_tqdm,
+        leave=True,
+        position=tqdm_position,
+    ):
+        if np.any(
+            coverage_array[spans[0][0] : spans[0][1]] <= desired_coverage
+        ) or np.any(coverage_array[spans[1][0] : spans[1][1]] <= desired_coverage):
+            yield read_hash
+            positions = get_positions(
+                spans,
+                trim_n_bases=ignore_n_bases_on_edges,
+                contig_length=contig_length,
+            )
+            unique_positions = np.unique(positions)
+            coverage_array[unique_positions] += 1
+            if coverage_array[unique_positions].max() >= coverage_limiter:
+                coverage_array = np.minimum(coverage_array, coverage_cap)
+        current, peak = tracemalloc.get_traced_memory()
+    logging.debug(
+        f" 12 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+        extra={"region": contig},
+    )
+    gc.collect()
+    current, peak = tracemalloc.get_traced_memory()
+    logging.debug(
+        f" 13 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+        extra={"region": contig},
+    )
 
 
 def process_contig(args: ContigJobInput) -> ContigJobOutput:
@@ -264,12 +446,20 @@ def process_contig(args: ContigJobInput) -> ContigJobOutput:
         ContigJobOutput: Metadata for the result, including the contig name,
         path to the temporary output BAM, and peak memory used during the process.
     """
-    start_time = datetime.datetime.now()
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] [%(region)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    args.start = datetime.datetime.now()
     if args.profile:
         tracemalloc.start()
     else:
         peak = 0
-    logging.debug(f"Starting to process contig {args.contig}")
+    logging.debug(
+        f"Starting to process contig {args.contig}", extra={"region": args.contig}
+    )
     disable_tqdm = not args.track_with_tqdm
     random.seed(args.seed)
     with (
@@ -286,59 +476,78 @@ def process_contig(args: ContigJobInput) -> ContigJobOutput:
         if read_count == 0:
             current, peak = tracemalloc.get_traced_memory()
             tracemalloc.stop()
-            return ContigJobOutput(args.contig, args.tmp_file_path, peak)
+            return ContigJobOutput(
+                contig=args.contig,
+                start=args.start,
+                end=datetime.datetime.now(),
+                temp_bam=args.tmp_file_path,
+                peak_memory=peak,
+            )
         logging.info(
-            f"Starting to subsample contig {args.contig} ({read_count} reads over {args.contig_length} positions)\n"
+            f"Starting to subsample contig {args.contig} ({read_count} reads over {args.contig_length} positions)",
+            extra={"region": args.contig},
         )
         if args.coverage_cap == 0:
             args.coverage_cap = args.desired_coverage * 2
-        coverage_array = np.zeros(
-            args.contig_length,
-            dtype=(
-                np.uint16
-                if (args.large_coverage_matrix or args.coverage_cap >= 255)
-                else np.uint8
-            ),
-        )
-        coverage_limiter = np.iinfo(coverage_array.dtype).max - 10
-        selected_read_hashes = set()
         sorted_read_hash_and_spans = (
-            get_read_hashes_to_spans_sorted_by_lower_to_higher_coverage(
+            get_read_hashes_to_spans_by_lower_to_higher_coverage(
                 bamfile=bamfile,
                 contig=args.contig,
                 contig_length=args.contig_length,
+                desired_coverage=args.desired_coverage,
                 coverage_cap=args.coverage_cap,
-                large_coverage_matrix=args.large_coverage_matrix,
+                low_coverage_bases_to_prioritize=args.low_coverage_bases_to_prioritize,
                 read_count=read_count,
                 disable_tqdm=disable_tqdm,
-                low_coverage_bases_to_prioritize=args.low_coverage_bases_to_prioritize,
                 tqdm_position=args.tqdm_position,
             )
         )
+        current, peak = tracemalloc.get_traced_memory()
+        logging.debug(
+            f" 8 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+            extra={"region": args.contig},
+        )
         gc.collect()
-        for read_hash, spans in tqdm.tqdm(
-            sorted_read_hash_and_spans,
-            desc=(f"Selecting reads for {args.contig}"),
-            unit=" reads",
-            disable=disable_tqdm,
-            leave=True,
-        ):
-            positions = get_unique_positions(
-                spans,
-                trim_n_bases=args.ignore_n_bases_on_edges,
+        current, peak = tracemalloc.get_traced_memory()
+        logging.debug(
+            f" 9 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+            extra={"region": args.contig},
+        )
+        selected_read_hashes = set(
+            select_reads(
+                sorted_read_hash_and_spans,
+                contig=args.contig,
                 contig_length=args.contig_length,
+                desired_coverage=args.desired_coverage,
+                coverage_cap=args.coverage_cap,
+                ignore_n_bases_on_edges=args.ignore_n_bases_on_edges,
+                large_coverage_matrix=args.large_coverage_matrix,
+                disable_tqdm=disable_tqdm,
+                tqdm_position=args.tqdm_position,
             )
-            if np.any(coverage_array[positions] < args.desired_coverage):
-                selected_read_hashes.add(read_hash)
-                coverage_array[positions] += 1
-                if coverage_array[positions].max() >= coverage_limiter:
-                    coverage_array = np.minimum(coverage_array, args.desired_coverage)
+        )
+        current, peak = tracemalloc.get_traced_memory()
+        logging.debug(
+            f" 14 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+            extra={"region": args.contig},
+        )
         del sorted_read_hash_and_spans
         gc.collect()
+        current, peak = tracemalloc.get_traced_memory()
+        logging.debug(
+            f" 15 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+            extra={"region": args.contig},
+        )
         if not selected_read_hashes:
             current, peak = tracemalloc.get_traced_memory()
             tracemalloc.stop()
-            return ContigJobOutput(args.contig, args.tmp_file_path, peak)
+            return ContigJobOutput(
+                contig=args.contig,
+                start=args.start,
+                end=datetime.datetime.now(),
+                temp_bam=args.tmp_file_path,
+                peak_memory=peak,
+            )
         bamfile.seek(0)
         total_output_reads = 0
         for read in tqdm.tqdm(
@@ -356,18 +565,36 @@ def process_contig(args: ContigJobInput) -> ContigJobOutput:
             if xxhash.xxh64(read.query_name).digest() in selected_read_hashes:
                 output_fh.write(read)
                 total_output_reads += 1
+    current, peak = tracemalloc.get_traced_memory()
+    logging.debug(
+        f" 16 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+        extra={"region": args.contig},
+    )
     del selected_read_hashes
     gc.collect()
+    current, peak = tracemalloc.get_traced_memory()
+    logging.debug(
+        f" 17 - [Memory usage: peak={format_memory(peak)}; current={format_memory(current)}]",
+        extra={"region": args.contig},
+    )
     if args.profile:
         current, peak = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
         logging.info(
             f"Done subsampling contig {args.contig} ({total_output_reads}/{read_count} = {total_output_reads / read_count * 100:.2f}%)"
-            f" [Time: {format_duration(datetime.datetime.now() - start_time)}] "
-            f" [Peak memory usage: {format_memory(peak)}]\n"
+            f" [Time: {format_duration(datetime.datetime.now() - args.start)}] "
+            f" [Peak memory usage: {format_memory(peak)}]\n",
+            extra={"region": args.contig},
         )
+        tracemalloc.stop()
     else:
         logging.info(
-            f"Done subsampling contig {args.contig} ({total_output_reads}/{read_count} = {total_output_reads / read_count * 100:.2f}%)\n"
+            f"Done subsampling contig {args.contig} ({total_output_reads}/{read_count} = {total_output_reads / read_count * 100:.2f}%)\n",
+            extra={"region": args.contig},
         )
-    return ContigJobOutput(args.contig, args.tmp_file_path, peak)
+    return ContigJobOutput(
+        contig=args.contig,
+        start=args.start,
+        end=datetime.datetime.now(),
+        temp_bam=args.tmp_file_path,
+        peak_memory=peak,
+    )

@@ -10,10 +10,11 @@ import re
 import tempfile
 import time
 import tracemalloc
-from multiprocessing.pool import AsyncResult
+from collections import defaultdict
+from enum import Enum
 from pathlib import Path
 from shutil import move
-from typing import Iterable, NamedTuple
+from typing import Iterable
 
 import psutil
 import pysam
@@ -33,9 +34,20 @@ DEFAULT_THREADS = 1
 DEFAULT_LOW_COV_BASES_TO_PRIORITIZE = 10
 
 
-class AsyncJob(NamedTuple):
-    job_input: ContigJobInput
-    async_result: AsyncResult
+class AsyncProcessJob:
+    def __init__(self, job_input: ContigJobInput, process: multiprocessing.Process):
+        self.job_input = job_input
+        self.process = process
+        self.start = datetime.datetime.now()
+
+    def is_alive(self) -> bool:
+        return self.process.is_alive()
+
+    def get_memory_usage(self) -> int:
+        try:
+            return psutil.Process(self.process.pid).memory_info().rss or 0
+        except:
+            return 0
 
 
 logging.basicConfig(
@@ -52,79 +64,181 @@ def get_read_count(bamfile: Path, contig: str) -> int:
     return read_count
 
 
-def parse_memory_limit(mem_str: str) -> float:
-    mem_str = mem_str.strip().upper()
+class MemoryUnit(Enum):
+    byte = "B"
+    kilobyte = "KB"
+    megabyte = "MB"
+    gigabyte = "GB"
+    terabyte = "TB"
+
+
+def parse_memory(
+    memory: str | int,
+    mem_unit: MemoryUnit | str = MemoryUnit.byte,
+    output_unit: MemoryUnit | str = MemoryUnit.gigabyte,
+) -> float:
+    mem_str = str(memory).strip().upper()
     match = re.match(r"^([\d.]+)\s*(TB|GB|MB|KB|B)?$", mem_str)
     if not match:
         raise ValueError(f"Invalid memory limit format: {mem_str}")
     value, unit = match.groups()
     value = float(value)
-    unit = unit or "GB"
-    unit_multipliers = {
-        "TB": 1024,
-        "GB": 1,
-        "MB": 1 / 1024,
-        "KB": 1 / (1024**2),
-        "B": 1 / (1024**3),
+    unit = MemoryUnit(unit or mem_unit)
+    unit_power = {
+        MemoryUnit.terabyte: 4,
+        MemoryUnit.gigabyte: 3,
+        MemoryUnit.megabyte: 2,
+        MemoryUnit.kilobyte: 1,
+        MemoryUnit.byte: 0,
     }
-    return value * unit_multipliers[unit]
+    return value * (1024 ** (unit_power[unit] - unit_power[MemoryUnit(output_unit)]))
 
+def get_system_available_memory_bytes() -> int:
+    return psutil.virtual_memory().available
 
-def get_used_memory_gb() -> float:
-    return psutil.virtual_memory().used / 1e9
+def get_system_total_memory_bytes() -> int:
+    return psutil.virtual_memory().total
+
+def process_wrapper(job: ContigJobInput, queue: multiprocessing.Queue) -> None:
+    process = process_contig(job)
+    queue.put((job, process))
 
 
 def adaptive_parallel_run(
-    pool,
     jobs: list[ContigJobInput],
     threads: int,
     contigs_to_parallelize_on: int,
-    max_memory_gb: float | None = None,
+    max_memory_bytes: int,
     check_interval: datetime.timedelta = datetime.timedelta(seconds=1),
 ) -> Iterable[ContigJobOutput]:
-    active: list[AsyncJob] = list()
+    queue = multiprocessing.Queue()
+    completed: list[ContigJobOutput] = list()
+    active: list[AsyncProcessJob] = list()
     pending: list[ContigJobInput] = jobs.copy()
-    completed_bar = tqdm.tqdm(
-        total=len(jobs), desc="Processing contigs", unit=" contigs"
-    )
-    with tqdm.tqdm(
-        total=len(jobs), desc="Processing contigs", unit=" contigs"
-    ) as completed_bar:
-        while pending or active:
-            threads_in_use = max(
-                len(active), sum(async_job.job_input.threads for async_job in active)
-            )
-            available_threads = threads - threads_in_use
-            available_slots = min(len(pending), contigs_to_parallelize_on - len(active))
-            done = [result for result in active if result.async_result.ready()]
-            for result in done:
-                active.remove(result)
-                completed_bar.update(1)
-                gc.collect()
-                yield result.async_result.get()
-            # Launch a new job if memory allows
-            if (
-                pending
-                and available_threads
-                and available_slots
-                and (
-                    len(active) == 0
-                    or max_memory_gb is None
-                    or (0 < get_used_memory_gb() < max_memory_gb)
+    peak_process_memory_usage: dict[str, int] = defaultdict(int)
+    peak_memory_usage = 0
+    job_input: ContigJobInput
+    job_output: ContigJobOutput
+    active_job: AsyncProcessJob | None
+    system_total_memory = psutil.virtual_memory().total
+    try:
+        with tqdm.tqdm(
+            total=len(jobs), desc="Processing contigs", unit=" contigs"
+        ) as completed_bar:
+            while pending or active:
+                current, peak = tracemalloc.get_traced_memory()
+                threads_in_use = max(
+                    len(active),
+                    sum(async_job.job_input.threads for async_job in active),
                 )
-            ):
-                job: ContigJobInput = pending.pop(0)
-                if available_threads > available_slots:
-                    job.threads = max(
-                        2, job.threads, available_threads // available_slots
+                available_threads = threads - threads_in_use
+                available_slots = min(
+                    len(pending), contigs_to_parallelize_on - len(active)
+                )
+                contig_to_memory_usage = {
+                    process.job_input.contig: process.get_memory_usage()
+                    for process in active
+                }
+                for contig, memory_usage in contig_to_memory_usage.items():
+                    peak_process_memory_usage[contig] = max(
+                        peak_process_memory_usage[contig], memory_usage
                     )
-                async_result = AsyncJob(
-                    job_input=job,
-                    async_result=pool.apply_async(process_contig, (job,)),
+                current_max_memory = (
+                    max(contig_to_memory_usage.values())
+                    if contig_to_memory_usage
+                    else 0
                 )
-                active.append(async_result)
-            else:
-                time.sleep(check_interval.total_seconds())
+                current_memory_used = current + sum(contig_to_memory_usage.values())
+                peak_memory_usage = max(peak_memory_usage, current_memory_used)
+                available_memory = max_memory_bytes - current_memory_used
+                system_available_memory = get_system_available_memory_bytes()
+                # Check and clean up finished jobs
+                for job in active:
+                    if not job.is_alive():
+                        job.process.join()
+                        active.remove(job)
+                while not queue.empty():
+                    job_input, job_output = queue.get()
+                    active_job = None
+                    for active_job in active:
+                        if active_job.job_input == job_input:
+                            active.remove(active_job)
+                            break
+                    duration = job_output.start - job_output.end
+                    logging.info(
+                        f"Job finished for contig {job_input.contig} after {format_duration(duration)},"
+                        f" with peak memory usage of {format_memory(max(peak_process_memory_usage[job_input.contig], job_output.peak_memory))}"
+                    )
+                    completed_bar.update(1)
+                    yield job_output
+                    completed.append(job_output)
+                    gc.collect()
+                if (
+                    pending
+                    and available_threads
+                    and available_slots
+                    and (
+                        len(active) == 0
+                        or (
+                            available_memory > current_max_memory
+                            and system_available_memory > current_max_memory
+                        )
+                    )
+                ):
+                    job: ContigJobInput = pending.pop(0)
+                    job.start = datetime.datetime.now()
+                    if available_threads > available_slots:
+                        job.threads = max(
+                            2, job.threads, available_threads // available_slots
+                        )
+                    logging.info(
+                        f"Starting job for contig {job.contig}"
+                        f" (contig length: {job.contig_length}; total reads: {job.read_count})"
+                        f" [Current memory usage: {format_memory(current_memory_used)}]"
+                    )
+                    proc = multiprocessing.Process(
+                        target=process_wrapper, args=(job, queue)
+                    )
+                    proc.start()
+                    active.append(AsyncProcessJob(job_input=job, process=proc))
+                elif current_memory_used > max_memory_bytes and len(active) > 1:
+                    last_job = sorted(active, key=lambda x: x.start)[-1]
+                    logging.warning(
+                        f"Current memory is above {format_memory(max_memory_bytes)}."
+                        f" Killing the most recently started process for contig {last_job.job_input.contig} (contig length: {last_job.job_input.contig_length}; total reads: {last_job.job_input.read_count})."
+                        f" This should free {format_memory(last_job.get_memory_usage())} of memory."
+                    )
+                    pending.insert(0, last_job.job_input)
+                    last_job.process.terminate()
+                    last_job.process.join()
+                    active.remove(last_job)
+                    gc.collect()
+                    logging.warning(
+                        f"Current memory usage: {format_memory(current_memory_used)}"
+                    )
+                    time.sleep(check_interval.total_seconds())
+                else:
+                    time.sleep(check_interval.total_seconds())
+                gc.collect()
+                completed_bar.set_description(
+                    f"Processing contigs (completed: {len(completed)}; active: {len(active)}; pending: {len(pending)}"
+                )
+    except Exception as exc:
+        logging.error(f"Error: {exc}")
+        raise
+    finally:
+        memory_usages = {
+            contig: format_memory(memory)
+            for contig, memory in sorted(
+                contig_to_memory_usage.items(), key=lambda x: x[1], reverse=True
+            )[:3]
+        }
+        logging.warning(f"Peak memory usage: {peak_memory_usage} ({memory_usages=})")
+        for process_job in active:
+            process_job.process.terminate()
+        for process_job in active:
+            process_job.process.join()
+        queue.close()
 
 
 def subsample_bam_parallel(
@@ -142,6 +256,11 @@ def subsample_bam_parallel(
     check_interval: datetime.timedelta = datetime.timedelta(seconds=1),
     verbose: bool = False,
 ) -> Path:
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
     tracemalloc.start()
     start = datetime.datetime.now()
     timestamp = start.strftime("%Y%m%d_%H%M%S") + f"{start.microsecond / 1e6:.4f}"[1:]
@@ -161,21 +280,24 @@ def subsample_bam_parallel(
     try:
         with pysam.AlignmentFile(input_bam, "rb", threads=threads) as bamfile:
             contigs = bamfile.references
-            logging.debug(f"{len(contigs)} contigs found in the BAM file.\n")
+            logging.debug(f"{len(contigs)} contigs found in the BAM file.")
             contig_to_lengths: dict[str, int] = {
-                contig: bamfile.get_contig_length(contig)
-                for contig in contigs
+                contig: bamfile.get_reference_length(contig) for contig in contigs
             }
             contig_to_read_counts: dict[str, int] = (
-                {contig: None for contig in contigs}
-                # {
-                #     contig: get_read_count(bamfile, contig=contig)
-                #     for contig, _ in tqdm.tqdm(
-                #         sorted(contig_to_lengths.items(), key=lambda ref_to_len: ref_to_len[1], reverse=True),
-                #         desc="Calculating read count per contig",
-                #         unit=" contigs"
-                #     )
-                # }
+                # {contig: None for contig in contigs}
+                {
+                    contig: get_read_count(bamfile, contig=contig)
+                    for contig, _ in tqdm.tqdm(
+                        sorted(
+                            contig_to_lengths.items(),
+                            key=lambda ref_to_len: ref_to_len[1],
+                            reverse=True,
+                        ),
+                        desc="Calculating read count per contig",
+                        unit=" contigs",
+                    )
+                }
             )
             contig_to_tmp_file_paths = {
                 contig: Path(
@@ -209,6 +331,7 @@ def subsample_bam_parallel(
                         if (track_with_tqdm and contigs_to_parallelize_on > 1)
                         else None
                     ),
+                    start=None,
                 )
                 for i, contig in enumerate(
                     sorted(
@@ -218,6 +341,7 @@ def subsample_bam_parallel(
                             contig_to_lengths[ref],
                             ref,
                         ),
+                        reverse=False,
                     )
                 )
             ]
@@ -226,22 +350,24 @@ def subsample_bam_parallel(
             for job in args_list:
                 contig_job_outputs.append(process_contig(job))
         else:
-            with multiprocessing.Pool(
-                processes=min(threads, contigs_to_parallelize_on)
-            ) as pool:
-                for result in adaptive_parallel_run(
-                    pool,
-                    jobs=args_list,
-                    threads=threads,
-                    contigs_to_parallelize_on=contigs_to_parallelize_on,
-                    max_memory_gb=(
-                        None
-                        if max_memory is None
-                        else (parse_memory_limit(max_memory) / threads)
-                    ),
-                    check_interval=check_interval,
-                ):
-                    contig_job_outputs.append(result)
+            for result in adaptive_parallel_run(
+                jobs=args_list,
+                threads=threads,
+                contigs_to_parallelize_on=contigs_to_parallelize_on,
+                max_memory_bytes=(
+                    psutil.virtual_memory().total
+                    if max_memory is None
+                    else (
+                        parse_memory(
+                            max_memory,
+                            mem_unit=MemoryUnit.gigabyte,
+                            output_unit=MemoryUnit.byte,
+                        )
+                    )
+                ),
+                check_interval=check_interval,
+            ):
+                contig_job_outputs.append(result)
 
         with pysam.AlignmentFile(input_bam, "rb") as bamfile:
             header = bamfile.header
@@ -272,9 +398,7 @@ def subsample_bam_parallel(
         logging.warning(
             f"It took {format_duration(datetime.datetime.now() - start)} time to run before the exception."
         )
-        logging.warning(
-            f"Peak memory usage in a single contig: {format_memory(peak)}"
-        )
+        logging.warning(f"Peak memory usage in a single contig: {format_memory(peak)}")
         for tmp_file_path in contig_to_tmp_file_paths.values():
             if tmp_file_path.exists():
                 tmp_file_path.unlink()

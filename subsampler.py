@@ -88,16 +88,24 @@ def subsample_bam_parallel(
         threads = max(1, (multiprocessing.cpu_count() - 1))
     if contigs_to_parallelize_on == 0 or contigs_to_parallelize_on > threads:
         contigs_to_parallelize_on = threads
-    track_with_tqdm = True if (contigs_to_parallelize_on == 1 or verbose) else False
     contig_to_tmp_file_paths = dict()
     contig_job_outputs = list()
     try:
         with pysam.AlignmentFile(input_bam, "rb", threads=threads) as bamfile:
             contigs = bamfile.references
+            track_with_tqdm = (
+                True
+                if (
+                    contigs_to_parallelize_on == 1
+                    or threads == 1
+                    or len(contigs) == 1
+                    or verbose
+                )
+                else False
+            )
             logging.debug(f"{len(contigs)} contigs found in the BAM file.\n")
             contig_to_lengths: dict[str, int] = {
-                contig: bamfile.get_reference_length(contig)
-                for contig in contigs
+                contig: bamfile.get_reference_length(contig) for contig in contigs
             }
             contig_to_read_counts: dict[str, int] = (
                 # {contig: None for contig in contigs}
@@ -147,6 +155,7 @@ def subsample_bam_parallel(
                             if track_with_tqdm and contigs_to_parallelize_on > 1
                             else None
                         ),
+                        start=None,
                     )
                     for i, contig in enumerate(
                         sorted(
@@ -167,10 +176,16 @@ def subsample_bam_parallel(
         logging.info(
             f"Starting processes in {threads} {'parallel threads' if threads > 1 else 'single thread'}\n"
         )
-
-        if contigs_to_parallelize_on == 1:
+        print(len(contigs))
+        if contigs_to_parallelize_on == 1 or len(contigs) == 1 or threads == 1:
             for job in args_list:
-                contig_job_outputs.append(process_contig(job))
+                job.start = datetime.datetime.now()
+                output = process_contig(job)
+                logging.info(
+                    f"Job finished for contig {output.contig} after {format_duration(output.end - output.start)},"
+                    f" with peak memory usage of {format_memory(output.peak_memory)}"
+                )
+                contig_job_outputs.append(output)
         else:
             with multiprocessing.Pool(
                 processes=min(threads, contigs_to_parallelize_on, len(contigs))
@@ -198,7 +213,11 @@ def subsample_bam_parallel(
                             final_bam.write(read)
                     Path(contig_job_output.temp_bam).unlink()
         current, main_peak = tracemalloc.get_traced_memory()
-        peak = main_peak + sum(sorted((process.peak_memory for process in contig_job_outputs), reverse=True)[:min(threads, contigs_to_parallelize_on)])
+        peak = main_peak + sum(
+            sorted(
+                (process.peak_memory for process in contig_job_outputs), reverse=True
+            )[: min(threads, contigs_to_parallelize_on)]
+        )
         logging.info(
             "Done subsampling.\n"
             f"It took {format_duration(datetime.datetime.now() - start)} time to run.\n"
@@ -212,9 +231,7 @@ def subsample_bam_parallel(
         logging.warning(
             f"It took {format_duration(datetime.datetime.now() - start)} time to run before the exception."
         )
-        logging.warning(
-            f"Peak memory usage in a single contig: {format_memory(peak)}"
-        )
+        logging.warning(f"Peak memory usage in a single contig: {format_memory(peak)}")
         raise
     finally:
         for tmp_file_path in contig_to_tmp_file_paths.values():
