@@ -104,7 +104,7 @@ def process_wrapper(job: ContigJobInput, queue: multiprocessing.Queue) -> None:
     queue.put((job, process))
 
 
-def adaptive_parallel_run(
+def memory_aware_parallel_run(
     jobs: list[ContigJobInput],
     threads: int,
     contigs_to_parallelize_on: int,
@@ -120,7 +120,6 @@ def adaptive_parallel_run(
     job_input: ContigJobInput
     job_output: ContigJobOutput
     active_job: AsyncProcessJob | None
-    system_total_memory = psutil.virtual_memory().total
     try:
         with tqdm.tqdm(
             total=len(jobs), desc="Processing contigs", unit=" contigs"
@@ -230,10 +229,10 @@ def adaptive_parallel_run(
         memory_usages = {
             contig: format_memory(memory)
             for contig, memory in sorted(
-                contig_to_memory_usage.items(), key=lambda x: x[1], reverse=True
+                peak_process_memory_usage.items(), key=lambda x: x[1], reverse=True
             )[:3]
         }
-        logging.warning(f"Peak memory usage: {peak_memory_usage} ({memory_usages=})")
+        logging.warning(f"Peak memory usage: {format_memory(peak_memory_usage)} (top 3 contigs: {memory_usages=})")
         for process_job in active:
             process_job.process.terminate()
         for process_job in active:
@@ -350,12 +349,12 @@ def subsample_bam_parallel(
             for job in args_list:
                 contig_job_outputs.append(process_contig(job))
         else:
-            for result in adaptive_parallel_run(
+            for result in memory_aware_parallel_run(
                 jobs=args_list,
                 threads=threads,
                 contigs_to_parallelize_on=contigs_to_parallelize_on,
                 max_memory_bytes=(
-                    psutil.virtual_memory().total
+                    (psutil.virtual_memory().total - parse_memory("1Gb")) * 0.9
                     if max_memory is None
                     else (
                         parse_memory(
@@ -459,7 +458,7 @@ if __name__ == "__main__":
         "--max-memory",
         type=str,
         default=None,
-        help="Maximum memory usage (e.g. 20GB, 20000MB, or 20).",
+        help="Maximum memory usage (e.g. 20GB, 20000MB, or 20). (default: (total memory - 1Gb) * 90%)",
     )
     parser.add_argument(
         "--check-interval",
